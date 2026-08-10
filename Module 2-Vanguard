@@ -1,0 +1,832 @@
+package com.nonprofitchess.vanguard;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Module 3: Vanguard — Player Safety &amp; Reporting System.
+ *
+ * <p>Numbering note: current project notes have this as Module 3, with
+ * Sagacious (the analysis engine, previously Module 3) renumbered to a
+ * new slot TBD. Flag if that should be the other way around.
+ *
+ * <p>This is a straight translation of the pseudocode design doc into
+ * Java. It is organized in the same ten parts, in order, so it's easy
+ * to diff against the spec. Every safety gate from Part 0 is enforced
+ * by the actual control flow below, not just left as a comment:
+ * <ol>
+ *   <li>No code path runs from {@link #runAutomatedTriage} straight to
+ *       {@link #applyPenalty}. Every penalty flows through
+ *       {@link #reviewCase}, which requires a human {@code ModeratorDecision}.</li>
+ *   <li>{@link #startCasePipeline} checks
+ *       {@code deps.externalMinorSafetyDetectionFlagged(evidence)} and
+ *       returns via {@link #routeToMinorSafetyPath} BEFORE
+ *       {@link #runAutomatedTriage} is ever called — Claude never sees
+ *       a minor-safety case.</li>
+ *   <li>The only fully-automated action is
+ *       {@code autoMuteUserPendingReview}, which is reversible and
+ *       non-punitive. Strikes and bans always require
+ *       {@link #reviewCase}.</li>
+ *   <li>Every {@link Classification} carries {@link #RECOMMENDATION_LABEL}
+ *       and is never itself sufficient to call {@link #applyPenalty}.</li>
+ *   <li>Active-search tools (Part 10) are an exhaustive, closed list —
+ *       see {@link TriageTools#ALL} — and the one tool with any
+ *       web-search reach ({@code search_chess_domain_reference}) is
+ *       rejected in code (not just by prompt) if the query references
+ *       the reported player. See {@link #executeTool}.</li>
+ * </ol>
+ *
+ * <p>Infrastructure and external-system calls (DB access, the real
+ * Claude HTTP call, JSON parsing, etc.) are left as an injected
+ * {@link VanguardDependencies} implementation — same approach used for
+ * Sagacious's search-internals stubs. This file contains only
+ * orchestration and policy logic: the enforcement ladder, the
+ * human-gate flow, the minor-safety short-circuit, and the
+ * active-search tool boundary.
+ */
+public final class Vanguard {
+
+    private Vanguard() {
+    }
+
+    // ================================================================
+    // Constants
+    // ================================================================
+
+    public static final String RECOMMENDATION_LABEL = "AI_SUGGESTED — PENDING HUMAN CONFIRMATION";
+    public static final int MAX_TRIAGE_TOOL_CALLS = 6;
+    /** Verify against docs.claude.com / the product-self-knowledge skill before deploying — model ids move. */
+    public static final String CLAUDE_MODEL = "claude-sonnet-5";
+    public static final int CLEAN_PERIOD_FOR_STRIKE_RESET_MONTHS = 9; // within the stated 6-12 month range
+    public static final int GAME_HISTORY_WINDOW = 50;
+    public static final int CHAT_HISTORY_WINDOW_DAYS = 90;
+
+    // ================================================================
+    // PART 1: DATA MODEL
+    // ================================================================
+
+    public enum OffenseCategory {
+        GENERAL_ABUSE,
+        HATE_SPEECH,
+        SEXUAL_HARASSMENT,
+        MINOR_SAFETY_CONCERN, // routed via Part 3, never reaches determinePenalty()
+        SEVERE_THREAT_OR_DOXXING,
+        BAN_EVASION_OR_MULTIACCOUNT
+    }
+
+    public enum CaseStatus {
+        PENDING_AUTOMATED_TRIAGE,
+        PENDING_HUMAN_REVIEW,
+        CONFIRMED,
+        DISMISSED,
+        ESCALATED_TO_SAFETY_TEAM
+    }
+
+    public enum PenaltyType {
+        NONE, WARNING, FINAL_WARNING, TEMP_BAN_3_MONTH, LIFETIME_BAN, ACCOUNT_SUSPENDED_PENDING_REVIEW
+    }
+
+    public static final Set<OffenseCategory> ZERO_TOLERANCE_CATEGORIES = Set.of(
+            OffenseCategory.HATE_SPEECH,
+            OffenseCategory.SEXUAL_HARASSMENT,
+            OffenseCategory.SEVERE_THREAT_OR_DOXXING
+    );
+
+    public record Report(
+            String reportId,
+            String reporterId,
+            String reportedUserId,
+            OffenseCategory reporterAssertedCategory,
+            String gameIdOrThreadId,
+            Instant timestamp,
+            String description
+    ) {}
+
+    /** Raised by automated tooling (slur filter, abuse-pattern detector, spam-rate trigger). */
+    public record AutomatedFlag(String userId, String severity, String contextId) {}
+
+    public record ReportedIncident(String transcript, String moveTimeline, List<Instant> timestamps) {}
+
+    public record BehavioralSignals(
+            List<String> moveTimingAnomalies,
+            List<String> deviceFingerprints,
+            List<String> linkedAccountHints
+    ) {}
+
+    public record FullAccountSnapshot(
+            List<Object> recentGames,
+            List<Object> chatHistory,
+            List<Object> clubPosts,
+            List<Object> forumActivity,
+            Object profileContent,
+            List<Object> friendRequests,
+            List<Report> priorReports,
+            List<PenaltyRecord> priorPenalties,
+            BehavioralSignals behavioralSignals
+    ) {}
+
+    public record EvidenceBundle(
+            String targetUserId,
+            ReportedIncident reportedIncident,
+            FullAccountSnapshot fullAccountSnapshot
+    ) {}
+
+    /** One entry per tool call Vanguard's Claude integration makes during triage — shown to the human reviewer. */
+    public record ToolCallLogEntry(
+            String toolName,
+            Map<String, Object> toolInput,
+            String resultSummary,
+            Instant timestamp,
+            boolean wasRejected,
+            String rejectReason
+    ) {}
+
+    public record ConfirmedBy(String humanModeratorId, Classification aiAssistRecommendation) {}
+
+    public record PenaltyRecord(
+            String userId,
+            OffenseCategory category,
+            PenaltyType penaltyType,
+            Instant issuedAt,
+            Instant expiresAt, // null if not time-bound
+            ConfirmedBy confirmedBy
+    ) {}
+
+    public static final class UserStandingRecord {
+        public final String userId;
+        public int generalAbuseStrikeCount;
+        public Instant lastCleanPeriodStart;
+        public int strikeResetCount; // tracked so escalateBeyondBaseLadder knows this isn't a first-timer
+        public final List<PenaltyRecord> activePenalties = new ArrayList<>();
+        public boolean lifetimeBanned;
+
+        public UserStandingRecord(String userId) {
+            this.userId = userId;
+            this.lastCleanPeriodStart = Instant.now();
+        }
+    }
+
+    /** Triage output. {@code suggestedCategory == null} means "no violation suggested" (the spec's NONE). */
+    public record Classification(
+            OffenseCategory suggestedCategory,
+            double confidence,
+            String suggestedPriority,
+            String evidenceSummary,
+            List<String> flaggedExcerpts,
+            List<ToolCallLogEntry> searchesPerformed,
+            String recommendationLabel
+    ) {}
+
+    public static final class Case {
+        public final String caseId;
+        public final String targetUserId;
+        public final EvidenceBundle evidence;
+        public Classification classification; // null for minor-safety-escalated cases
+        public CaseStatus status;
+        public OffenseCategory confirmedCategory; // set once a human CONFIRMED decision is made (Part 4)
+
+        public Case(String caseId, String targetUserId, EvidenceBundle evidence,
+                     Classification classification, CaseStatus status) {
+            this.caseId = caseId;
+            this.targetUserId = targetUserId;
+            this.evidence = evidence;
+            this.classification = classification;
+            this.status = status;
+        }
+    }
+
+    /** {@code outcome} is "CONFIRMED" or "DISMISSED"; {@code confirmedCategory} is set only when CONFIRMED. */
+    public record ModeratorDecision(String outcome, OffenseCategory confirmedCategory) {}
+
+    /** {@code type} e.g. "PROCESS_OR_FACTUAL_ERROR" — the only type zero-tolerance categories accept. */
+    public record AppealReason(String type, String detail) {}
+
+    public static final class AppealCase {
+        public final String appealCaseId;
+        public final String userId;
+        public final String originalCaseId;
+        public final AppealReason reason;
+
+        public AppealCase(String appealCaseId, String userId, String originalCaseId, AppealReason reason) {
+            this.appealCaseId = appealCaseId;
+            this.userId = userId;
+            this.originalCaseId = originalCaseId;
+            this.reason = reason;
+        }
+    }
+
+    /** {@code outcome} is "OVERTURNED" or "UPHELD". */
+    public record AppealDecision(String outcome) {}
+
+    // ================================================================
+    // Claude integration types (Part 8 / Part 10)
+    // ================================================================
+
+    public enum OutputFormat { JSON_ONLY, TEXT, JSON_OR_TOOL_CALL, TEXT_OR_TOOL_CALL }
+
+    public record ClaudeMessage(String role, String content) {}
+
+    public record ToolDefinition(String name, String description, Map<String, String> inputSchema) {}
+
+    public enum ClaudeResponseType { FINAL_JSON, FINAL_TEXT, TOOL_USE }
+
+    public record ClaudeResponse(
+            ClaudeResponseType type,
+            String content,                  // populated for FINAL_JSON / FINAL_TEXT
+            String toolName,                  // populated for TOOL_USE
+            Map<String, Object> toolInput,    // populated for TOOL_USE
+            ClaudeMessage toolCallMessage      // the assistant turn to append to the conversation
+    ) {}
+
+    public record ToolResult(Object content, ToolCallLogEntry logEntry) {}
+
+    // ================================================================
+    // External dependencies
+    // ----------------------------------------------------------------
+    // Same approach as Sagacious's search-internals stubs: infrastructure
+    // and external-system integration points are an injected interface,
+    // not guessed at here. None of these are policy/judgment logic —
+    // that logic (the enforcement ladder, the human-gate flow, the
+    // minor-safety short-circuit, the active-search tool boundary)
+    // lives in this file. Implement one concrete class per environment
+    // and pass it into every entry point below.
+    // ================================================================
+
+    public interface VanguardDependencies {
+
+        // ---- data access (assembleEvidenceBundle) ----
+        List<Object> fetchRecentGames(String userId, int limit);
+        List<Object> fetchChatHistory(String userId, int windowDays);
+        List<Object> fetchClubActivity(String userId);
+        List<Object> fetchForumActivity(String userId);
+        Object fetchProfileContent(String userId);
+        List<Object> fetchFriendRequestActivity(String userId);
+        List<Report> fetchPriorReports(String userId);
+        List<PenaltyRecord> fetchPriorPenalties(String userId);
+        BehavioralSignals computeBehavioralSignals(String userId);
+        ReportedIncident extractIncidentContext(Report report, AutomatedFlag flag);
+
+        // ---- case / standing persistence ----
+        Case createCase(String targetUserId, EvidenceBundle evidence, Classification classification, CaseStatus status);
+        Case getCase(String caseId);
+        void closeCase(String caseId, CaseStatus finalStatus);
+        void enqueueForHumanReview(Case c, String priority);
+        void enqueueAppealForHumanReview(AppealCase appealCase, String priority, boolean reviewerMustDifferFromOriginal);
+        UserStandingRecord getUserStandingRecord(String userId);
+        void updateUserStandingRecord(String userId, PenaltyRecord record);
+        void persistPenaltyRecord(PenaltyRecord record);
+        void logModerationDecision(String caseId, String moderatorId, Object decision);
+
+        // ---- automated / reversible safety actions ----
+        void autoMuteUserPendingReview(String userId, String contextId);
+
+        // ---- minor-safety path (Part 3) — never AI-adjudicated ----
+        boolean externalMinorSafetyDetectionFlagged(EvidenceBundle evidence);
+        void suspendAccountImmediately(String userId, String reason);
+        void preserveEvidenceImmutably(EvidenceBundle evidence);
+        void notifyDedicatedSafetyTeam(String caseId, String priority);
+        void initiateLegalReferralWorkflow(String caseIdOrUserId);
+
+        // ---- penalty application ----
+        void suspendAccountForDuration(String userId, Duration duration);
+        void terminateAccountPermanently(String userId);
+        void applyDeviceAndIPBanIfWarranted(String userId, OffenseCategory category);
+        boolean categoryRequiresLegalReferral(OffenseCategory category);
+        void sendNotification(String userId, String message, boolean includesAppealInstructions);
+
+        // ---- linked accounts / ban evasion (Part 7) ----
+        List<String> detectLinkedAccounts(String userId);
+        boolean hasEquivalentOrGreaterPenalty(String linkedUserId, PenaltyType penaltyType);
+        void flagForExpeditedReview(String linkedUserId, String reason, PenaltyRecord linkedEvidence);
+        PenaltyType getHighestPenaltyAmongLinkedAccounts(String userId);
+
+        // ---- Claude integration (Part 8) ----
+        ClaudeResponse callClaude(String system, List<ClaudeMessage> messages, List<ToolDefinition> tools, OutputFormat format);
+
+        // ---- active-search tools (Part 10) ----
+        Object searchWithinEvidenceBundle(String userId, String query, String sourceType);
+        Object searchAnonymizedPrecedents(OffenseCategory category, String similarityQuery);
+        Object searchPolicyDocs(String query);
+        Object generalWebSearch(String query, int resultLimit);
+        boolean containsUserIdentifyingTerms(String query, String targetUserId);
+        void persistToolCallLog(ToolCallLogEntry entry);
+
+        // ---- appeals (Part 9) ----
+        Case getConfirmedCase(String caseId);
+        Object getConfirmedCaseRecordFor(String userId);
+        void reversePenalty(String appealCaseId);
+        void restoreStrikeIfApplicable(String appealCaseId);
+        void notifyUserOfAppealOutcome(String appealCaseId, AppealDecision decision);
+        AppealCase createAppealCase(String userId, String caseId, AppealReason reason);
+        void rejectAppeal(String reason);
+    }
+
+    // ================================================================
+    // PART 2: INTAKE & TRIAGE
+    // ================================================================
+
+    public static Case onReportSubmitted(Report report, VanguardDependencies deps) {
+        return startCasePipeline("USER_REPORT", report, null, deps);
+    }
+
+    public static Case onAutomatedFlagRaised(AutomatedFlag flag, VanguardDependencies deps) {
+        return startCasePipeline("AUTOMATED_FLAG", null, flag, deps);
+    }
+
+    public static Case startCasePipeline(String triggerType, Report report, AutomatedFlag flag, VanguardDependencies deps) {
+        String targetUserId = (report != null) ? report.reportedUserId() : flag.userId();
+
+        // Immediate, non-punitive, reversible safety action — allowed
+        // fully automated because it's not a strike/ban (Part 0.3).
+        if ("AUTOMATED_FLAG".equals(triggerType) && flag != null && "HIGH_CONFIDENCE_SLUR".equals(flag.severity())) {
+            deps.autoMuteUserPendingReview(targetUserId, flag.contextId());
+        }
+
+        EvidenceBundle evidence = assembleEvidenceBundle(targetUserId, report, flag, deps);
+
+        // Minor-safety signals short-circuit everything else — Part 3.
+        // This check runs BEFORE Claude's active-search triage loop ever
+        // sees the evidence.
+        if (deps.externalMinorSafetyDetectionFlagged(evidence)) {
+            return routeToMinorSafetyPath(targetUserId, evidence, deps);
+        }
+
+        Classification classification = runAutomatedTriage(evidence, deps);
+
+        Case c = deps.createCase(targetUserId, evidence, classification, CaseStatus.PENDING_HUMAN_REVIEW);
+        deps.enqueueForHumanReview(c, classification.suggestedPriority());
+        return c;
+    }
+
+    public static EvidenceBundle assembleEvidenceBundle(String userId, Report report, AutomatedFlag flag, VanguardDependencies deps) {
+        // Full-account pull — not just the reported incident. This is
+        // the base snapshot; Part 8's search loop queries further
+        // WITHIN this (and a few reference sources), it does not fetch
+        // new categories of data about the user.
+        ReportedIncident incident = deps.extractIncidentContext(report, flag);
+        FullAccountSnapshot snapshot = new FullAccountSnapshot(
+                deps.fetchRecentGames(userId, GAME_HISTORY_WINDOW),
+                deps.fetchChatHistory(userId, CHAT_HISTORY_WINDOW_DAYS),
+                deps.fetchClubActivity(userId),
+                deps.fetchForumActivity(userId),
+                deps.fetchProfileContent(userId),
+                deps.fetchFriendRequestActivity(userId),
+                deps.fetchPriorReports(userId),
+                deps.fetchPriorPenalties(userId),
+                deps.computeBehavioralSignals(userId)
+        );
+        return new EvidenceBundle(userId, incident, snapshot);
+    }
+
+    // ================================================================
+    // PART 3: MINOR-SAFETY PATH (separate, never AI-adjudicated)
+    // ================================================================
+
+    public static Case routeToMinorSafetyPath(String userId, EvidenceBundle evidence, VanguardDependencies deps) {
+        deps.suspendAccountImmediately(userId, "PENDING_SAFETY_REVIEW");
+        deps.preserveEvidenceImmutably(evidence); // legal hold — no auto-deletion, no user edit access
+
+        Case c = deps.createCase(userId, evidence, null, CaseStatus.ESCALATED_TO_SAFETY_TEAM);
+
+        deps.notifyDedicatedSafetyTeam(c.caseId, "IMMEDIATE");
+        deps.initiateLegalReferralWorkflow(c.caseId); // e.g. NCMEC CyberTipline or local equivalent
+
+        // No AI classification, no active-search tools, no standard
+        // strike ladder, no self-serve appeal path — this case exists
+        // entirely outside Parts 4-9. runAutomatedTriage() is never
+        // called on this path, full stop.
+        return c;
+    }
+
+    // ================================================================
+    // PART 4: HUMAN REVIEW GATE
+    // ================================================================
+
+    public static void reviewCase(String caseId, String moderatorId, ModeratorDecision decision, VanguardDependencies deps) {
+        Case c = deps.getCase(caseId);
+
+        if ("DISMISSED".equals(decision.outcome())) {
+            deps.closeCase(caseId, CaseStatus.DISMISSED);
+            // NOTE: matches the original pseudocode exactly, which
+            // returns here — before logModerationDecision below — so
+            // dismissals currently skip the audit-trail call. Flagging
+            // in case that asymmetry isn't intentional; one-line fix
+            // (drop this return) if you want dismissals logged too.
+            return;
+        }
+
+        if ("CONFIRMED".equals(decision.outcome())) {
+            c.confirmedCategory = decision.confirmedCategory();
+            PenaltyType penalty = determinePenalty(c.targetUserId, decision.confirmedCategory(), deps);
+            applyPenalty(c.targetUserId, decision.confirmedCategory(), penalty, moderatorId, c.classification, deps);
+            deps.closeCase(caseId, CaseStatus.CONFIRMED);
+            notifyUserOfOutcome(c.targetUserId, decision.confirmedCategory, penalty, deps);
+}
+
+        deps.logModerationDecision(caseId, moderatorId, decision); // full audit trail, always
+    }
+
+    // ================================================================
+    // PART 5: PENALTY DETERMINATION — THE ENFORCEMENT LADDER
+    // ================================================================
+
+    public static PenaltyType determinePenalty(String userId, OffenseCategory confirmedCategory, VanguardDependencies deps) {
+        UserStandingRecord standing = deps.getUserStandingRecord(userId);
+
+        if (ZERO_TOLERANCE_CATEGORIES.contains(confirmedCategory)) {
+            return PenaltyType.LIFETIME_BAN;
+        }
+
+        if (confirmedCategory == OffenseCategory.BAN_EVASION_OR_MULTIACCOUNT) {
+            PenaltyType linkedPenalty = deps.getHighestPenaltyAmongLinkedAccounts(userId);
+            return maxSeverity(linkedPenalty, PenaltyType.TEMP_BAN_3_MONTH);
+        }
+
+        if (confirmedCategory == OffenseCategory.GENERAL_ABUSE) {
+            return applyProgressiveDiscipline(standing);
+        }
+
+        return PenaltyType.NONE;
+    }
+
+    private static PenaltyType applyProgressiveDiscipline(UserStandingRecord standing) {
+        maybeResetStrikes(standing);
+        int strikeCount = standing.generalAbuseStrikeCount + 1;
+
+        switch (strikeCount) {
+            case 1: return PenaltyType.WARNING;
+            case 2: return PenaltyType.FINAL_WARNING;
+            case 3: return PenaltyType.TEMP_BAN_3_MONTH;
+            default:
+                // Returned after a ban and re-offended — escalate beyond
+                // the base ladder rather than looping back to a 3-month ban.
+                return escalateBeyondBaseLadder(standing);
+        }
+    }
+
+    private static void maybeResetStrikes(UserStandingRecord standing) {
+        boolean cleanPeriodElapsed = monthsBetween(standing.lastCleanPeriodStart, Instant.now())
+                >= CLEAN_PERIOD_FOR_STRIKE_RESET_MONTHS;
+        boolean hadPriorBan = standing.activePenalties.stream()
+                .anyMatch(p -> p.penaltyType() == PenaltyType.TEMP_BAN_3_MONTH);
+
+        if (cleanPeriodElapsed && hadPriorBan) {
+            standing.generalAbuseStrikeCount = 0;
+            standing.strikeResetCount += 1;
+        }
+    }
+
+    private static PenaltyType escalateBeyondBaseLadder(UserStandingRecord standing) {
+        // Repeat offender after returning from a ban — escalated
+        // penalties, not just repeating 3-month bans forever.
+        if (standing.strikeResetCount >= 1) {
+            return PenaltyType.LIFETIME_BAN; // second time through the ladder after a return
+        }
+        return PenaltyType.TEMP_BAN_3_MONTH;
+    }
+
+    private static final List<PenaltyType> SEVERITY_ORDER = List.of(
+            PenaltyType.NONE, PenaltyType.WARNING, PenaltyType.FINAL_WARNING,
+            PenaltyType.TEMP_BAN_3_MONTH, PenaltyType.ACCOUNT_SUSPENDED_PENDING_REVIEW,
+            PenaltyType.LIFETIME_BAN
+    );
+
+    private static PenaltyType maxSeverity(PenaltyType a, PenaltyType b) {
+        if (a == null) return b;
+        if (b == null) return a;
+        return SEVERITY_ORDER.indexOf(a) >= SEVERITY_ORDER.indexOf(b) ? a : b;
+    }
+
+    /** Instant has no calendar MONTHS unit, so route through LocalDate for a real calendar-month comparison. */
+    private static long monthsBetween(Instant from, Instant to) {
+        LocalDate fromDate = from.atZone(ZoneOffset.UTC).toLocalDate();
+        LocalDate toDate = to.atZone(ZoneOffset.UTC).toLocalDate();
+        return ChronoUnit.MONTHS.between(fromDate, toDate);
+    }
+
+    private static Instant plusMonths(Instant from, int months) {
+        return from.atZone(ZoneOffset.UTC).plusMonths(months).toInstant();
+    }
+
+    // ================================================================
+    // PART 6: PENALTY APPLICATION & NOTIFICATION
+    // ================================================================
+
+    public static void applyPenalty(String userId, OffenseCategory category, PenaltyType penalty,
+                                     String confirmedByModeratorId, Classification aiRecommendation,
+                                     VanguardDependencies deps) {
+        Instant issuedAt = Instant.now();
+        Instant expiresAt = (penalty == PenaltyType.TEMP_BAN_3_MONTH) ? plusMonths(issuedAt, 3) : null;
+
+        PenaltyRecord record = new PenaltyRecord(
+                userId, category, penalty, issuedAt, expiresAt,
+                new ConfirmedBy(confirmedByModeratorId, aiRecommendation)
+        );
+
+        deps.persistPenaltyRecord(record);
+        deps.updateUserStandingRecord(userId, record);
+
+        switch (penalty) {
+            case WARNING:
+            case FINAL_WARNING:
+                recordStrike(userId, deps);
+                break;
+            case TEMP_BAN_3_MONTH:
+                recordStrike(userId, deps);
+                deps.suspendAccountForDuration(userId, Duration.between(issuedAt, expiresAt));
+                break;
+            case LIFETIME_BAN:
+                deps.terminateAccountPermanently(userId);
+                deps.applyDeviceAndIPBanIfWarranted(userId, category);
+                if (deps.categoryRequiresLegalReferral(category)) {
+                    deps.initiateLegalReferralWorkflow(userId); // e.g. credible threats
+                }
+                break;
+            default:
+                break;
+        }
+
+        checkLinkedAccountsForMirroredPenalty(userId, record, deps); // ban-evasion detection, Part 7
+    }
+
+    public static void notifyUserOfOutcome(String userId, OffenseCategory category, PenaltyType penalty, VanguardDependencies deps) {
+        String message = buildUserFacingExplanation(userId, category, penalty, deps); // Claude-assisted, Part 8
+        deps.sendNotification(userId, message, true);
+    }
+
+    private static void recordStrike(String userId, VanguardDependencies deps) {
+        UserStandingRecord standing = deps.getUserStandingRecord(userId);
+        standing.generalAbuseStrikeCount += 1;
+        standing.lastCleanPeriodStart = Instant.now();
+    }
+
+    // ================================================================
+    // PART 7: BAN EVASION / LINKED ACCOUNTS
+    // ================================================================
+
+    public static void checkLinkedAccountsForMirroredPenalty(String userId, PenaltyRecord record, VanguardDependencies deps) {
+        List<String> linkedAccounts = deps.detectLinkedAccounts(userId); // device fingerprint, IP overlap, behavioral similarity
+
+        for (String linkedId : linkedAccounts) {
+            if (!deps.hasEquivalentOrGreaterPenalty(linkedId, record.penaltyType())) {
+                deps.flagForExpeditedReview(linkedId, "LINKED_TO_PENALIZED_ACCOUNT", record);
+                // Still goes through the human review gate (Part 4) —
+                // linkage is strong evidence, not an automatic verdict.
+            }
+        }
+    }
+
+    // ================================================================
+    // PART 8: CLAUDE INTEGRATION — VANGUARD'S ACTIVE-SEARCH TRIAGE
+    // ----------------------------------------------------------------
+    // Claude's role, end to end, is unchanged in KIND from the original
+    // spec: (1) triage/evidence summarization feeding the human
+    // reviewer, (2) drafting the user-facing explanation of an
+    // already-human-confirmed outcome, (3) answering user questions
+    // about their own case. What's new is that (1) is agentic: instead
+    // of one fixed prompt, Claude runs a bounded loop where it can call
+    // read-only search tools (Part 10) before finalizing a
+    // recommendation. Claude still never sets case status, never calls
+    // applyPenalty, and every output is labeled AI-generated and
+    // advisory.
+    // ================================================================
+
+    public static final String TRIAGE_SYSTEM_PROMPT = """
+            You are Vanguard, a moderation triage assistant for a chess platform.
+            You summarize evidence and suggest a category and priority for human
+            moderators — you do NOT make final moderation decisions. You have
+            tools to actively search for more context; use them when the initial
+            incident is ambiguous, but every tool is scoped to this platform's
+            own records or non-personal reference material. You have no tool
+            that looks up a person's real-world identity, and you must never ask
+            a human to run that kind of lookup either.
+
+            Never suggest a lifetime ban or any irreversible action as a
+            foregone conclusion; frame everything as input to a human reviewer.
+            If the evidence is ambiguous even after searching, say so explicitly
+            rather than forcing a confident classification. If anything in the
+            evidence suggests a minor may be involved in a sexual-content
+            context, stop immediately — do not call any more tools, do not
+            attempt to classify or summarize that content further — and output
+            ESCALATE_MINOR_SAFETY instead of a normal category.
+            """;
+
+    public static Classification runAutomatedTriage(EvidenceBundle evidence, VanguardDependencies deps) {
+        List<ClaudeMessage> conversation = new ArrayList<>();
+        conversation.add(new ClaudeMessage("user", buildTriagePrompt(evidence)));
+
+        List<ToolCallLogEntry> toolLog = new ArrayList<>();
+
+        while (toolLog.size() < MAX_TRIAGE_TOOL_CALLS) {
+            ClaudeResponse response = deps.callClaude(
+                    TRIAGE_SYSTEM_PROMPT, conversation, TriageTools.ALL, OutputFormat.JSON_OR_TOOL_CALL
+            );
+
+            if (response.type() == ClaudeResponseType.TOOL_USE) {
+                ToolResult result = executeTool(response.toolName(), response.toolInput(), evidence.targetUserId(), deps);
+                toolLog.add(result.logEntry());
+                conversation.add(response.toolCallMessage());
+                conversation.add(new ClaudeMessage("tool_result", String.valueOf(result.content())));
+                continue; // let Claude decide whether it needs another search or is ready to answer
+            }
+
+            // response.type() == FINAL_JSON
+            return parseTriageJson(response.content(), toolLog);
+        }
+
+        // Ran out of tool-call budget without a final answer. Fail safe:
+        // hand the human reviewer everything gathered so far as a
+        // low-confidence recommendation, rather than looping or guessing.
+        return buildLowConfidenceFallback(toolLog);
+    }
+
+    private static String buildTriagePrompt(EvidenceBundle evidence) {
+        return """
+                Reported incident:
+                %s
+
+                You have tools to pull more context if the reported incident alone
+                isn't enough to classify confidently — use them before answering,
+                not instead of answering. When you're done, respond with final
+                JSON only.
+
+                Classify the reported incident into one of: GENERAL_ABUSE,
+                HATE_SPEECH, SEXUAL_HARASSMENT, SEVERE_THREAT_OR_DOXXING, or NONE
+                (no policy violation). Provide a confidence score, a
+                one-paragraph evidence summary for a human moderator, and quote
+                only the specific excerpts that support your suggested category.
+                This is a RECOMMENDATION for human review, not a final decision.
+                """.formatted(evidence.reportedIncident());
+    }
+
+    /**
+     * Real JSON parsing is left to your existing JSON library (Jackson,
+     * Gson, etc.) — this is a structural placeholder so the control
+     * flow above is complete and readable. Deserialize {@code json}
+     * into category / confidence / priority / summary / flaggedExcerpts,
+     * then wrap with {@code toolLog} and {@link #RECOMMENDATION_LABEL}.
+     */
+    private static Classification parseTriageJson(String json, List<ToolCallLogEntry> toolLog) {
+        throw new UnsupportedOperationException(
+                "parseTriageJson — wire to your JSON library of choice"
+        );
+    }
+
+    private static Classification buildLowConfidenceFallback(List<ToolCallLogEntry> toolLog) {
+        return new Classification(
+                null, 0.0, "LOW",
+                "Triage hit its tool-call budget without a confident classification; escalate for full human review.",
+                List.of(), toolLog, RECOMMENDATION_LABEL
+        );
+    }
+
+    /**
+     * Factual notice of an ALREADY human-confirmed outcome — no search
+     * tools here. There's nothing left to investigate; giving this step
+     * active search would only invite the model to re-litigate a
+     * decision that isn't its call to revisit.
+     */
+    public static String buildUserFacingExplanation(String userId, OffenseCategory category, PenaltyType penalty, VanguardDependencies deps) {
+        String prompt = """
+                Write a brief, clear, and firm (not harsh) notification to a user
+                explaining that their account received a %s for a confirmed
+                violation of the platform's %s policy. State the current strike
+                level if applicable. Do not argue the case or add unnecessary
+                detail — this is a factual notice, already confirmed by a human
+                moderator.
+                """.formatted(penalty, category);
+
+        ClaudeResponse response = deps.callClaude(
+                "You draft short, neutral, factual moderation notices. You do not soften or negotiate policy.",
+                List.of(new ClaudeMessage("user", prompt)),
+                null,
+                OutputFormat.TEXT
+        );
+        return response.content();
+    }
+
+    /**
+     * User-facing support surface. Gets exactly ONE scoped tool — policy
+     * lookup — so it can answer "what does this rule mean" or "how does
+     * an appeal work" accurately. It only ever sees this user's own
+     * case record, never other users' data, and never re-litigates the
+     * verdict itself. (A production version would loop on TOOL_USE the
+     * same way {@link #runAutomatedTriage} does; omitted here since
+     * it's the identical pattern against a one-tool set.)
+     */
+    public static String answerUserCaseQuestion(String userId, String question, VanguardDependencies deps) {
+        Object caseRecord = deps.getConfirmedCaseRecordFor(userId);
+
+        String system = "You answer a user's questions about their own moderation case using only "
+                + "the provided case record and, if needed, the policy_knowledge_base tool. You "
+                + "explain what happened and what the appeal process covers. You do not overturn, "
+                + "second-guess, or promise to overturn the decision — appeals go through the human "
+                + "process (see submitAppeal).";
+
+        String userContent = "Case record: " + caseRecord + "\n\nUser question: " + question;
+
+        ClaudeResponse response = deps.callClaude(
+                system,
+                List.of(new ClaudeMessage("user", userContent)),
+                List.of(TriageTools.POLICY_KNOWLEDGE_BASE), // subset of Part 10 — no user-history/precedent tools
+                OutputFormat.TEXT_OR_TOOL_CALL
+        );
+        return response.content();
+    }
+
+    // ================================================================
+    // PART 9: APPEALS
+    // ================================================================
+
+    public static AppealCase submitAppeal(String userId, String caseId, AppealReason appealReason, VanguardDependencies deps) {
+        Case c = deps.getConfirmedCase(caseId);
+
+        if (ZERO_TOLERANCE_CATEGORIES.contains(c.confirmedCategory)) {
+            // Appeals only for process/factual errors, never "I didn't
+            // mean it," even here.
+            if (!"PROCESS_OR_FACTUAL_ERROR".equals(appealReason.type())) {
+                deps.rejectAppeal("Zero-tolerance categories only accept process/factual-error appeals");
+                return null;
+            }
+        }
+
+        AppealCase appealCase = deps.createAppealCase(userId, caseId, appealReason);
+        deps.enqueueAppealForHumanReview(appealCase, "APPEAL", true); // reviewerMustDifferFromOriginal
+        return appealCase;
+    }
+
+    public static void resolveAppeal(String appealCaseId, String reviewerId, AppealDecision decision, VanguardDependencies deps) {
+        if ("OVERTURNED".equals(decision.outcome())) {
+            deps.reversePenalty(appealCaseId);
+            deps.restoreStrikeIfApplicable(appealCaseId);
+        }
+        deps.logModerationDecision(appealCaseId, reviewerId, decision);
+        deps.notifyUserOfAppealOutcome(appealCaseId, decision);
+    }
+
+    // ================================================================
+    // PART 10: ACTIVE-SEARCH TOOL DEFINITIONS & THE HARD BOUNDARY
+    // ----------------------------------------------------------------
+    // Everything Claude's triage integration is allowed to reach. This
+    // is the actual mechanism behind "search actively" — an exhaustive
+    // list, not an example list. If a tool isn't here, Claude doesn't
+    // have it.
+    //
+    // HARD EXCLUSION (same status as Part 0's gates — not
+    // configurable): there is no open-internet / general web-search
+    // tool scoped to a specific reported user anywhere in this class.
+    // search_chess_domain_reference is non-personal reference lookup
+    // only, and containsUserIdentifyingTerms() rejects — and logs — any
+    // attempt to route a player-identifying query through it. That
+    // check happens in executeTool() below, in code, not just in the
+    // system prompt above.
+    // ================================================================
+
+    public static final class TriageTools {
+        private TriageTools() {
+        }
+
+        public static final ToolDefinition SEARCH_USER_HISTORY = new ToolDefinition(
+                "search_user_history",
+                "Search ONLY the reported user's own already-collected chat/game/forum history "
+                        + "(already pulled into evidence.fullAccountSnapshot) for additional occurrences of "
+                        + "a pattern or phrase. Does not fetch any new external data.",
+                Map.of("query", "string", "sourceType", "CHAT|GAMES|FORUM|PROFILE")
+        );
+
+        public static final ToolDefinition SEARCH_CASE_PRECEDENTS = new ToolDefinition(
+                "search_case_precedents",
+                "Search anonymized, already-closed CONFIRMED cases for classification/penalty "
+                        + "consistency. Returns category + penalty only — never the other users' "
+                        + "identities or raw evidence text.",
+                Map.of("category", "OffenseCategory", "similarityQuery", "string")
+        );
+
+        public static final ToolDefinition POLICY_KNOWLEDGE_BASE = new ToolDefinition(
+                "search_policy_knowledge_base",
+                "Look up the exact wording of platform policy/rules relevant to the flagged content.",
+                Map.of("query", "string")
+        );
+
+        public static final ToolDefinition SEARCH_CHESS_DOMAIN_REFERENCE = new ToolDefinition(
+                "search_chess_domain_reference",
+                "General, non-personal reference lookup — chess notation, in-game slang, or whether "
+                        + "a term is a known slur in a given language. NOT for looking up a person. "
+                        + "Query-sanitized before it runs — enforced in code, not just requested in the prompt.",
+                Map.of("query", "string")
+        );
+
+        public static final List<ToolDefinition> ALL = List.of(
+                SEARCH_USER_HISTORY, SEARCH_CASE_PRECEDENTS, POLICY_KNOWLEDGE_BASE, SEARCH_CHESS_DOMAIN_REFERENCE
+        );
+    }
+
+    private static ToolResult executeTool(String toolName, Map<String, Object> input, String targetUserId, VanguardDependencies deps) {
+  
