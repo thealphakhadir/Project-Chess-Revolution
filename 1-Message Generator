@@ -1,0 +1,721 @@
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Module 3b(1) — Rookie Message Generator.
+ *
+ * <p>Self-contained build of the post-game coaching message generator for
+ * OpenChess. Given a finished {@link GameRecord} and an {@link AnalysisResult},
+ * it walks the evaluation curve and emits an ordered, capped list of
+ * {@link CoachMessage}s ready for delivery to the UI.</p>
+ *
+ * <p><strong>Design notes</strong></p>
+ * <ul>
+ *   <li>Post-game only. No pre-move advice is ever produced.</li>
+ *   <li>All text here is factual/analytical. Tone and persona adaptation is a
+ *       downstream concern (future PersonaAdapter, Module 3b(2)).</li>
+ *   <li>Evaluation scale is assumed to be pawns from White's perspective.
+ *       Confirm this matches Sagacious output before relying on thresholds.</li>
+ *   <li>Sagacious / Explorer / Codex integrations are stubbed behind small
+ *       static helpers ({@link Stubs}) so the pipeline runs today on canned
+ *       data with zero external dependencies.</li>
+ * </ul>
+ *
+ * <p><strong>Run:</strong> {@code javac MessageGenerator.java && java MessageGenerator}</p>
+ */
+public final class MessageGenerator {
+
+    // =====================================================================
+    // Enums
+    // =====================================================================
+
+    /** Categorises what a {@link CoachMessage} is reacting to. */
+    public enum MessageType {
+        BLUNDER("Blunder"),
+        INACCURACY("Inaccuracy"),
+        BRILLIANT("Brilliant move"),
+        THEORY_NOTE("Theory note"),
+        TACTIC_MISSED("Missed tactic"),
+        SUMMARY("Game summary"),
+        ENCOURAGEMENT("Encouragement");
+
+        private final String label;
+        MessageType(String label) { this.label = label; }
+        public String label() { return label; }
+    }
+
+    /** Relative importance used for ordering and cap survival. */
+    public enum MessagePriority {
+        LOW(0), MEDIUM(1), HIGH(2);
+
+        private final int rank;
+        MessagePriority(int rank) { this.rank = rank; }
+        public int rank() { return rank; }
+        public boolean atLeast(MessagePriority o) { return this.rank >= o.rank; }
+    }
+
+    // =====================================================================
+    // Core value types
+    // =====================================================================
+
+    /** Immutable unit of coaching output. The contract for downstream consumers. */
+    public static final class CoachMessage {
+        public static final int GLOBAL_MOVE_INDEX = -1;
+
+        private final int moveIndex;
+        private final MessageType type;
+        private final MessagePriority priority;
+        private final String rawText;
+        private final List<String> keySquares;
+        private final List<Integer> relatedMoveIndexes;
+
+        private CoachMessage(Builder b) {
+            this.moveIndex = b.moveIndex;
+            this.type = b.type;
+            this.priority = b.priority != null ? b.priority : defaultPriority(b.type);
+            this.rawText = b.rawText == null ? "" : b.rawText;
+            this.keySquares = Collections.unmodifiableList(new ArrayList<>(b.keySquares));
+            this.relatedMoveIndexes = Collections.unmodifiableList(new ArrayList<>(b.relatedMoveIndexes));
+        }
+
+        public static MessagePriority defaultPriority(MessageType type) {
+            switch (type) {
+                case BLUNDER: return MessagePriority.HIGH;
+                case BRILLIANT: return MessagePriority.MEDIUM;
+                case INACCURACY:
+                case TACTIC_MISSED: return MessagePriority.MEDIUM;
+                case THEORY_NOTE:
+                case ENCOURAGEMENT: return MessagePriority.LOW;
+                case SUMMARY: return MessagePriority.HIGH;
+                default: return MessagePriority.LOW;
+            }
+        }
+
+        public int moveIndex() { return moveIndex; }
+        public MessageType type() { return type; }
+        public MessagePriority priority() { return priority; }
+        public String rawText() { return rawText; }
+        public List<String> keySquares() { return keySquares; }
+        public List<Integer> relatedMoveIndexes() { return relatedMoveIndexes; }
+        public boolean isGlobal() { return moveIndex == GLOBAL_MOVE_INDEX; }
+
+        @Override
+        public String toString() {
+            String where = isGlobal() ? "global" : ("move " + moveIndex);
+            return "[" + type + "/" + priority + "@" + where + "] " + rawText;
+        }
+
+        public static Builder builder() { return new Builder(); }
+
+        public static final class Builder {
+            private int moveIndex = GLOBAL_MOVE_INDEX;
+            private MessageType type;
+            private MessagePriority priority;
+            private String rawText;
+            private final List<String> keySquares = new ArrayList<>();
+            private final List<Integer> relatedMoveIndexes = new ArrayList<>();
+
+            public Builder moveIndex(int v) { this.moveIndex = v; return this; }
+            public Builder type(MessageType v) { this.type = v; return this; }
+            public Builder priority(MessagePriority v) { this.priority = v; return this; }
+            public Builder rawText(String v) { this.rawText = v; return this; }
+            public Builder keySquares(List<String> v) { if (v != null) this.keySquares.addAll(v); return this; }
+            public Builder keySquare(String s) { this.keySquares.add(s); return this; }
+            public Builder relatedMoves(List<Integer> v) { if (v != null) this.relatedMoveIndexes.addAll(v); return this; }
+
+            public CoachMessage build() {
+                if (type == null) throw new IllegalStateException("type is required");
+                return new CoachMessage(this);
+            }
+        }
+    }
+
+    /** A single sampled point on the evaluation curve (White's view, pawns). */
+    public record EvalPoint(int moveIndex, double scoreWhite) {
+        public EvalPoint {
+            if (scoreWhite == Double.NaN) throw new IllegalArgumentException("evaluation must not be NaN");
+        }
+    }
+
+    /** Ordered sequence of {@link EvalPoint}s covering a whole game. */
+    public static final class EvalCurve {
+        private final List<EvalPoint> points;
+
+        public EvalCurve(List<EvalPoint> points) {
+            this.points = points == null ? new ArrayList<>() : new ArrayList<>(points);
+            this.points.sort(Comparator.comparingInt(EvalPoint::moveIndex));
+        }
+
+        public static EvalCurve empty() { return new EvalCurve(Collections.emptyList()); }
+        public List<EvalPoint> points() { return Collections.unmodifiableList(points); }
+        public int size() { return points.size(); }
+        public boolean isEmpty() { return points.isEmpty(); }
+
+        public EvalPoint at(int moveIndex) {
+            for (EvalPoint p : points) if (p.moveIndex() == moveIndex) return p;
+            return null;
+        }
+
+        public double peakForWhite() {
+            double m = Double.NEGATIVE_INFINITY;
+            for (EvalPoint p : points) m = Math.max(m, p.scoreWhite());
+            return points.isEmpty() ? 0.0 : m;
+        }
+
+        public double troughForWhite() {
+            double m = Double.POSITIVE_INFINITY;
+            for (EvalPoint p : points) m = Math.min(m, p.scoreWhite());
+            return points.isEmpty() ? 0.0 : m;
+        }
+    }
+
+    /** Minimal representation of a finished game, sufficient for post-game analysis. */
+    public static final class GameRecord {
+        public enum Colour { WHITE, BLACK }
+
+        private final String whiteName;
+        private final String blackName;
+        private final List<String> sanMoves;
+        private final List<String> fenAfterEachMove;
+        private final String result;
+        private final Colour userColour;
+        private final String timeControl;
+
+        private GameRecord(Builder b) {
+            this.whiteName = nz(b.whiteName);
+            this.blackName = nz(b.blackName);
+            this.sanMoves = Collections.unmodifiableList(new ArrayList<>(b.sanMoves));
+            this.fenAfterEachMove = Collections.unmodifiableList(new ArrayList<>(b.fenAfterEachMove));
+            this.result = nz(b.result);
+            this.userColour = b.userColour != null ? b.userColour : Colour.WHITE;
+            this.timeControl = nz(b.timeControl);
+        }
+
+        private static String nz(String s) { return s == null ? "" : s; }
+
+        public String whiteName() { return whiteName; }
+        public String blackName() { return blackName; }
+        public List<String> sanMoves() { return sanMoves; }
+        public List<String> fenAfterEachMove() { return fenAfterEachMove; }
+        public String result() { return result; }
+        public Colour userColour() { return userColour; }
+        public String timeControl() { return timeControl; }
+        public int plyCount() { return sanMoves.size(); }
+
+        public static Builder builder() { return new Builder(); }
+
+        public static final class Builder {
+            private String whiteName;
+            private String blackName;
+            private final List<String> sanMoves = new ArrayList<>();
+            private final List<String> fenAfterEachMove = new ArrayList<>();
+            private String result;
+            private Colour userColour;
+            private String timeControl;
+
+            public Builder whiteName(String v) { this.whiteName = v; return this; }
+            public Builder blackName(String v) { this.blackName = v; return this; }
+            public Builder addMove(String san, String fenAfter) {
+                this.sanMoves.add(san);
+                this.fenAfterEachMove.add(fenAfter);
+                return this;
+            }
+            public Builder result(String v) { this.result = v; return this; }
+            public Builder userColour(Colour v) { this.userColour = v; return this; }
+            public Builder timeControl(String v) { this.timeControl = v; return this; }
+            public GameRecord build() { return new GameRecord(this); }
+        }
+    }
+
+    /** A tactical opportunity that existed but was not taken. */
+    public record TacticFinding(int moveIndex, String motif, String description, List<String> keySquares) {
+        public TacticFinding {
+            keySquares = keySquares == null ? List.of() : List.copyOf(keySquares);
+        }
+    }
+
+    /** A point where the user departed from recognised opening theory. */
+    public record TheoryDeviation(int moveIndex, String ecoCode, String openingName, String deviationNote) {}
+
+    /** Aggregated analytical findings for a single finished game. */
+    public static final class AnalysisResult {
+        private final EvalCurve evalCurve;
+        private final List<TacticFinding> missedTactics;
+        private final List<TheoryDeviation> theoryDeviations;
+        private final List<int[]> brilliantMoments;
+
+        private AnalysisResult(Builder b) {
+            this.evalCurve = b.evalCurve != null ? b.evalCurve : EvalCurve.empty();
+            this.missedTactics = Collections.unmodifiableList(new ArrayList<>(b.missedTactics));
+            this.theoryDeviations = Collections.unmodifiableList(new ArrayList<>(b.theoryDeviations));
+            this.brilliantMoments = Collections.unmodifiableList(new ArrayList<>(b.brilliantMoments));
+        }
+
+        public EvalCurve evalCurve() { return evalCurve; }
+        public List<TacticFinding> missedTactics() { return missedTactics; }
+        public List<TheoryDeviation> theoryDeviations() { return theoryDeviations; }
+        public List<int[]> brilliantMoments() { return brilliantMoments; }
+
+        public static Builder builder() { return new Builder(); }
+
+        public static final class Builder {
+            private EvalCurve evalCurve;
+            private final List<TacticFinding> missedTactics = new ArrayList<>();
+            private final List<TheoryDeviation> theoryDeviations = new ArrayList<>();
+            private final List<int[]> brilliantMoments = new ArrayList<>();
+
+            public Builder evalCurve(EvalCurve v) { this.evalCurve = v; return this; }
+            public Builder addTactic(TacticFinding v) { this.missedTactics.add(v); return this; }
+            public Builder addTheory(TheoryDeviation v) { this.theoryDeviations.add(v); return this; }
+            public Builder addBrilliantMoment(int moveIndex) { this.brilliantMoments.add(new int[]{moveIndex}); return this; }
+            public AnalysisResult build() { return new AnalysisResult(this); }
+        }
+    }
+
+    /** Tunable thresholds and limits governing generation behaviour. */
+    public static final class GenerationConfig {
+        private final double inaccuracyThreshold;
+        private final double blunderThreshold;
+        private final double brillianceThreshold;
+        private final int maxMessages;
+        private final int batchSizeWindow;
+        private final boolean includeTheory;
+        private final boolean includeTactics;
+
+        private GenerationConfig(Builder b) {
+            this.inaccuracyThreshold = b.inaccuracyThreshold;
+            this.blunderThreshold = b.blunderThreshold;
+            this.brillianceThreshold = b.brillianceThreshold;
+            this.maxMessages = b.maxMessages;
+            this.batchSizeWindow = b.batchSizeWindow;
+            this.includeTheory = b.includeTheory;
+            this.includeTactics = b.includeTactics;
+        }
+
+        public double inaccuracyThreshold() { return inaccuracyThreshold; }
+        public double blunderThreshold() { return blunderThreshold; }
+        public double brillianceThreshold() { return brillianceThreshold; }
+        public int maxMessages() { return maxMessages; }
+        public int batchSizeWindow() { return batchSizeWindow; }
+        public boolean includeTheory() { return includeTheory; }
+        public boolean includeTactics() { return includeTactics; }
+
+        public static GenerationConfig defaults() { return new Builder().build(); }
+        public static Builder builder() { return new Builder(); }
+
+        public static final class Builder {
+            private double inaccuracyThreshold = 0.5;
+            private double blunderThreshold = 2.0;
+            private double brillianceThreshold = 1.5;
+            private int maxMessages = 6;
+            private int batchSizeWindow = 5;
+            private boolean includeTheory = true;
+            private boolean includeTactics = true;
+
+            public Builder inaccuracyThreshold(double v) { this.inaccuracyThreshold = v; return this; }
+            public Builder blunderThreshold(double v) { this.blunderThreshold = v; return this; }
+            public Builder brillianceThreshold(double v) { this.brillianceThreshold = v; return this; }
+            public Builder maxMessages(int v) { this.maxMessages = v; return this; }
+            public Builder batchSizeWindow(int v) { this.batchSizeWindow = v; return this; }
+            public Builder includeTheory(boolean v) { this.includeTheory = v; return this; }
+            public Builder includeTactics(boolean v) { this.includeTactics = v; return this; }
+            public GenerationConfig build() { return new GenerationConfig(this); }
+        }
+    }
+
+    // =====================================================================
+    // Stubs (replace with real modules when available)
+    // =====================================================================
+
+    /** Stand-ins for Sagacious / Explorer / Codex. Canned data for now. */
+    public static final class Stubs {
+
+        private Stubs() {}
+
+        /** Synthetic finished game (Codex stand-in). */
+        public static GameRecord sampleGame() {
+            GameRecord.Builder b = GameRecord.builder()
+                    .whiteName("Abdul")
+                    .blackName("Opponent")
+                    .result("1-0")
+                    .userColour(GameRecord.Colour.WHITE)
+                    .timeControl("10+0");
+
+            String[] sans = {"e4","e5","Nf3","Nc6","Bb5","a6","O-O"};
+            String[] fens = {
+                "rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1",
+                "rnbqkbnr/pppp1ppp/8/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 1 2",
+                "r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 1 2",
+                "r1bqkbnr/pppn1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 0 3",
+                "r1bqkbnr/pppn1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R b KQkq - 0 3",
+                "r1bqkbnr/lppn1ppp/1pn5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 0 4",
+                "r1bqkbnr/lppn1ppp/1pn5/4p3/4P3/5N2/PPPP1PPP/RNBQ1RB1 b kq - 0 4"
+            };
+            for (int i = 0; i < sans.length; i++) b.addMove(sans[i], fens[i]);
+            return b.build();
+        }
+
+        /** Plausible canned analysis (Sagacious stand-in). */
+        public static AnalysisResult analyze(GameRecord game) {
+            double[][] sample = {
+                {-1, 0.0}, {1, 0.1}, {2, 0.0}, {3, 0.2}, {4, 0.1},
+                {5, 0.3}, {6, 0.2}, {7, 0.4}, {8, 0.3}, {9, 0.5},
+                {10, 0.4}, {11, 0.6}, {12, 0.5}, {13, 0.7}, {14, -1.6},
+                {15, -1.4}, {16, -1.0}, {17, -0.5}, {18, 0.0}, {19, 0.6},
+                {20, 2.2}, {21, 2.0}, {22, 1.8}, {23, 1.5}, {24, 1.2},
+                {25, 1.0}, {26, 0.2}, {27, 0.3}, {28, 0.4}
+            };
+            List<EvalPoint> pts = new ArrayList<>();
+            for (double[] row : sample) {
+                if ((int) row[0] <= game.plyCount() || game.plyCount() == 0) {
+                    pts.add(new EvalPoint((int) row[0], row[1]));
+                }
+            }
+            return AnalysisResult.builder()
+                    .evalCurve(new EvalCurve(pts))
+                    .addBrilliantMoment(20)
+                    .addTactic(new TacticFinding(26, "fork",
+                            "a knight fork on f2 attacking king and queen", List.of("f2")))
+                    .build();
+        }
+
+        /** Canned theory deviations (Explorer stand-in). */
+        public static List<TheoryDeviation> theoryNotes(GameRecord game) {
+            return List.of(new TheoryDeviation(3, "B12", "Caro-Kann Defence",
+                    "expected ...d6 met instead by an early piece sortie"));
+        }
+    }
+
+    // =====================================================================
+    // Generator core
+    // =====================================================================
+
+    private final GenerationConfig config;
+
+    public MessageGenerator(GenerationConfig config) {
+        this.config = config != null ? config : GenerationConfig.defaults();
+    }
+
+    public MessageGenerator() {
+        this(GenerationConfig.defaults());
+    }
+
+    /** Run all passes and return the final ordered message list. */
+    public List<CoachMessage> generate(GameRecord game, AnalysisResult analysis) {
+        if (game == null || analysis == null) {
+            throw new IllegalArgumentException("game and analysis must not be null");
+        }
+
+        List<CoachMessage> all = new ArrayList<>();
+        all.addAll(passMistakes(game, analysis));
+        all.addAll(passBrilliance(game, analysis));
+        if (config.includeTheory()) all.addAll(passTheory(game, analysis));
+        if (config.includeTactics()) all.addAll(passTactics(game, analysis));
+
+        List<CoachMessage> batched = batchMistakes(all);
+        List<CoachMessage> kept = applyCap(batched);
+        List<CoachMessage> demoted = demotedFrom(batched, kept);
+
+        CoachMessage summary = composeSummary(game, analysis, kept, demoted);
+        List<CoachMessage> result = new ArrayList<>(kept);
+        result.add(summary);
+
+        result.sort(Comparator
+                .comparingInt((CoachMessage m) -> m.isGlobal() ? Integer.MAX_VALUE : m.moveIndex())
+                .thenComparing(m -> m.type().label()));
+        return result;
+    }
+
+    private List<CoachMessage> passMistakes(GameRecord game, AnalysisResult analysis) {
+        List<CoachMessage> out = new ArrayList<>();
+        EvalCurve curve = analysis.evalCurve();
+        if (curve.isEmpty()) return out;
+
+        double sign = game.userColour() == GameRecord.Colour.WHITE ? 1.0 : -1.0;
+        List<EvalPoint> pts = curve.points();
+
+        for (int i = 1; i < pts.size(); i++) {
+            EvalPoint prev = pts.get(i - 1);
+            EvalPoint cur = pts.get(i);
+            if (!isUserPly(game, cur.moveIndex())) continue;
+
+            double beforeUser = sign * prev.scoreWhite();
+            double afterUser = sign * cur.scoreWhite();
+            double drop = beforeUser - afterUser;
+
+            if (drop >= config.blunderThreshold()) {
+                out.add(buildMistake(cur.moveIndex(), MessageType.BLUNDER, drop, game));
+            } else if (drop >= config.inaccuracyThreshold()) {
+                out.add(buildMistake(cur.moveIndex(), MessageType.INACCURACY, drop, game));
+            }
+        }
+        return out;
+    }
+
+    private CoachMessage buildMistake(int moveIndex, MessageType type, double drop, GameRecord game) {
+        String san = sanOfPly(game, moveIndex);
+        String text;
+        if (type == MessageType.BLUNDER) {
+            text = String.format("%s (move %d) cost roughly %.1f pawns. Position swung sharply against you.",
+                    san, moveIndex, drop);
+        } else {
+            text = String.format("%s (move %d) was slightly off; best play held about %.1f pawns more.",
+                    san, moveIndex, drop);
+        }
+        return CoachMessage.builder()
+                .moveIndex(moveIndex)
+                .type(type)
+                .priority(MessagePriority.defaultPriority(type))
+                .rawText(text)
+                .keySquare(squareFromFenHighlight())
+                .build();
+    }
+
+    private List<CoachMessage> passBrilliance(GameRecord game, AnalysisResult analysis) {
+        List<CoachMessage> out = new ArrayList<>();
+        double sign = game.userColour() == GameRecord.Colour.WHITE ? 1.0 : -1.0;
+        List<EvalPoint> pts = analysis.evalCurve().points();
+
+        Map<Integer, Boolean> seen = new LinkedHashMap<>();
+        for (int[] bm : analysis.brilliantMoments()) {
+            int mi = bm[0];
+            if (seen.put(mi, Boolean.TRUE) != null) continue;
+            String san = sanOfPly(game, mi);
+            out.add(CoachMessage.builder()
+                    .moveIndex(mi)
+                    .type(MessageType.BRILLIANT)
+                    .priority(MessagePriority.MEDIUM)
+                    .rawText(String.format("%s (move %d) was a strong choice — it improved your position notably.", san, mi))
+                    .build());
+        }
+
+        for (int i = 1; i < pts.size(); i++) {
+            int mi = pts.get(i).moveIndex();
+            if (!isUserPly(game, mi) || seen.containsKey(mi)) continue;
+            double rise = sign * (pts.get(i).scoreWhite() - pts.get(i - 1).scoreWhite());
+            if (rise >= config.brillianceThreshold()) {
+                seen.put(mi, Boolean.TRUE);
+                String san = sanOfPly(game, mi);
+                out.add(CoachMessage.builder()
+                        .moveIndex(mi)
+                        .type(MessageType.BRILLIANT)
+                        .priority(MessagePriority.MEDIUM)
+                        .rawText(String.format("%s (move %d) gained about %.1f pawns — well played.", san, mi, rise))
+                        .build());
+            }
+        }
+        return out;
+    }
+
+    private List<CoachMessage> passTheory(GameRecord game, AnalysisResult analysis) {
+        List<CoachMessage> out = new ArrayList<>();
+        for (TheoryDeviation td : analysis.theoryDeviations()) {
+            String name = td.openingName().isEmpty() ? "the opening" : td.openingName();
+            String eco = td.ecoCode().isEmpty() ? "" : " (" + td.ecoCode() + ")";
+            out.add(CoachMessage.builder()
+                    .moveIndex(td.moveIndex())
+                    .type(MessageType.THEORY_NOTE)
+                    .priority(MessagePriority.LOW)
+                    .rawText(String.format("Around move %d you stepped away from %s%s: %s",
+                            td.moveIndex(), name, eco, td.deviationNote()))
+                    .build());
+        }
+        return out;
+    }
+
+    private List<CoachMessage> passTactics(GameRecord game, AnalysisResult analysis) {
+        List<CoachMessage> out = new ArrayList<>();
+        for (TacticFinding tf : analysis.missedTactics()) {
+            out.add(CoachMessage.builder()
+                    .moveIndex(tf.moveIndex())
+                    .type(MessageType.TACTIC_MISSED)
+                    .priority(MessagePriority.MEDIUM)
+                    .rawText(String.format("On move %d there was a %s available: %s",
+                            tf.moveIndex(), tf.motif(), tf.description()))
+                    .keySquares(tf.keySquares())
+                    .build());
+        }
+        return out;
+    }
+
+    private List<CoachMessage> batchMistakes(List<CoachMessage> msgs) {
+        List<CoachMessage> mistakes = new ArrayList<>();
+        List<CoachMessage> others = new ArrayList<>();
+        for (CoachMessage m : msgs) {
+            if (m.type() == MessageType.BLUNDER || m.type() == MessageType.INACCURACY) mistakes.add(m);
+            else others.add(m);
+        }
+        mistakes.sort(Comparator.comparingInt(CoachMessage::moveIndex));
+
+        List<CoachMessage> batched = new ArrayList<>();
+        int i = 0;
+        while (i < mistakes.size()) {
+            CoachMessage head = mistakes.get(i);
+            List<Integer> group = new ArrayList<>();
+            group.add(head.moveIndex());
+            int j = i + 1;
+            while (j < mistakes.size()
+                    && mistakes.get(j).type() == head.type()
+                    && mistakes.get(j).moveIndex() - head.moveIndex() <= config.batchSizeWindow()) {
+                group.add(mistakes.get(j).moveIndex());
+                j++;
+            }
+            if (group.size() == 1) {
+                batched.add(head);
+            } else {
+                String moves = joinMoves(group);
+                String text = String.format("%s occurred several times nearby (%s) — worth reviewing this stretch together.",
+                        head.type().label(), moves);
+                batched.add(CoachMessage.builder()
+                        .moveIndex(head.moveIndex())
+                        .type(head.type())
+                        .priority(MessagePriority.HIGH)
+                        .rawText(text)
+                        .relatedMoves(group)
+                        .build());
+            }
+            i = j;
+        }
+        batched.addAll(others);
+        return batched;
+    }
+
+    private List<CoachMessage> applyCap(List<CoachMessage> msgs) {
+        List<CoachMessage> nonSummary = new ArrayList<>();
+        for (CoachMessage m : msgs) if (m.type() != MessageType.SUMMARY) nonSummary.add(m);
+
+        if (nonSummary.size() <= config.maxMessages()) return nonSummary;
+
+        List<CoachMessage> ranked = new ArrayList<>(nonSummary);
+        ranked.sort(Comparator
+                .comparingInt((CoachMessage m) -> -m.priority().rank())
+                .thenComparingInt(m -> m.isGlobal() ? Integer.MAX_VALUE : m.moveIndex()));
+
+        List<CoachMessage> kept = new ArrayList<>(ranked.subList(0, config.maxMessages()));
+        for (CoachMessage m : ranked) {
+            if (m.type() == MessageType.BRILLIANT && !kept.contains(m)) kept.add(m);
+        }
+        return kept;
+    }
+
+    private List<CoachMessage> demotedFrom(List<CoachMessage> all, List<CoachMessage> kept) {
+        List<CoachMessage> demoted = new ArrayList<>();
+        for (CoachMessage m : all) {
+            if (m.type() != MessageType.SUMMARY && !kept.contains(m)) demoted.add(m);
+        }
+        return demoted;
+    }
+
+    private CoachMessage composeSummary(GameRecord game, AnalysisResult analysis,
+                                        List<CoachMessage> kept, List<CoachMessage> demoted) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(resultPhrase(game)).append(". ");
+
+        int turning = findTurningPoint(game, analysis);
+        if (turning > 0) sb.append(String.format("The pivotal moment came around move %d. ", turning));
+
+        long blunders = kept.stream().filter(m -> m.type() == MessageType.BLUNDER).count();
+        long brilliants = kept.stream().filter(m -> m.type() == MessageType.BRILLIANT).count();
+        if (blunders > 0 && brilliants > 0) {
+            sb.append(String.format("You had %d strong moment(s) alongside %d costly mistake(s) — a balanced game. ",
+                    brilliants, blunders));
+        } else if (blunders > 0) {
+            sb.append(String.format("Focus next time on avoiding the %d flagged mistake(s). ", blunders));
+        } else if (brilliants > 0) {
+            sb.append(String.format("Nice work — %d standout moment(s) and no major errors. ", brilliants));
+        } else {
+            sb.append("A quiet game overall; review the key positions to sharpen judgement. ");
+        }
+
+        if (!demoted.isEmpty()) {
+            sb.append("Also worth reviewing: ").append(joinMoves(demoted.stream().map(CoachMessage::moveIndex).toList())).append(".");
+        }
+
+        return CoachMessage.builder()
+                .moveIndex(CoachMessage.GLOBAL_MOVE_INDEX)
+                .type(MessageType.SUMMARY)
+                .priority(MessagePriority.HIGH)
+                .rawText(sb.toString().trim())
+                .build();
+    }
+
+    private boolean isUserPly(GameRecord game, int ply) {
+        if (ply <= 0) return false;
+        return game.userColour() == GameRecord.Colour.WHITE ? (ply % 2 == 1) : (ply % 2 == 0);
+    }
+
+    private String sanOfPly(GameRecord game, int ply) {
+        List<String> sans = game.sanMoves();
+        return (ply >= 1 && ply <= sans.size()) ? sans.get(ply - 1) : "?";
+    }
+
+    private String resultPhrase(GameRecord g) {
+        String r = g.result();
+        if ("1-0".equals(r)) return g.userColour() == GameRecord.Colour.WHITE ? "You won" : "You lost";
+        if ("0-1".equals(r)) return g.userColour() == GameRecord.Colour.BLACK ? "You won" : "You lost";
+        if ("1/2-1/2".equals(r)) return "The game was drawn";
+        return "The game ended";
+    }
+
+    private int findTurningPoint(GameRecord game, AnalysisResult analysis) {
+        double sign = game.userColour() == GameRecord.Colour.WHITE ? 1.0 : -1.0;
+        List<EvalPoint> pts = analysis.evalCurve().points();
+        int bestIdx = -1;
+        double bestDelta = 0;
+        for (int i = 1; i < pts.size(); i++) {
+            double d = Math.abs(sign * (pts.get(i).scoreWhite() - pts.get(i - 1).scoreWhite()));
+            if (d > bestDelta) { bestDelta = d; bestIdx = pts.get(i).moveIndex(); }
+        }
+        return bestIdx;
+    }
+
+    /** Placeholder hook — real square extraction needs board geometry (later module). */
+    private String squareFromFenHighlight() { return ""; }
+
+    private String joinMoves(List<Integer> moves) {
+        if (moves == null || moves.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (int k = 0; k < moves.size(); k++) {
+            if (k > 0) sb.append(", ");
+            sb.append(moves.get(k));
+        }
+        return sb.toString();
+    }
+
+    // =====================================================================
+    // Demo entry point
+    // =====================================================================
+
+    public static void main(String[] args) {
+        GameRecord game = Stubs.sampleGame();
+
+        AnalysisResult base = Stubs.analyze(game);
+        AnalysisResult analysis = AnalysisResult.builder()
+                .evalCurve(base.evalCurve())
+                .addTactic(base.missedTactics().get(0))
+                .addBrilliantMoment(20)
+                .addTheory(Stubs.theoryNotes(game).get(0))
+                .build();
+
+        MessageGenerator generator = new MessageGenerator(GenerationConfig.defaults());
+        List<CoachMessage> messages = generator.generate(game, analysis);
+
+        System.out.println("=== Rookie · Post-Game Messages ===");
+        System.out.printf("Player: %s (%s)  Result: %s%n%n",
+                game.userColour() == GameRecord.Colour.WHITE ? game.whiteName() : game.blackName(),
+                game.userColour(), game.result());
+
+        int n = 1;
+        for (CoachMessage m : messages) {
+            System.out.printf("[%d] %-14s %-7s  %s%n", n++, m.type(), m.priority(), m.rawText());
+            if (!m.keySquares().isEmpty()) {
+                System.out.printf("      focus squares: %s%n", String.join(", ", m.keySquares()));
+            }
+        }
+        System.out.printf("%nTotal: %d message(s)%n", messages.size());
+    }
+}
