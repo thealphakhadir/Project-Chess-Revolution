@@ -1,0 +1,559 @@
+```java
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.PriorityQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * Module 3b(3) — Rookie Delivery Adapter &amp; State Machine.
+ *
+ * <p>Self-contained build of the post-game message <em>delivery</em> layer for
+ * OpenChess. It consumes the ordered {@link CoachMessage} list produced by
+ * Module 3b(1) (the Message Generator) and drives them through a timed state
+ * machine: chime, tap, "activating translator" transition, reveal, dismiss,
+ * with a "Lost in Translation" error path.</p>
+ *
+ * <p><strong>Separation of concerns</strong></p>
+ * <ul>
+ *   <li>{@link DeliveryAdapter} owns PACE — what to deliver next, when to
+ *       re-chime, when to end the session. Pure scheduling logic.</li>
+ *   <li>The state machine ({@link StateMachine}) owns PRESENTATION — the
+ *       visual/audio states and transitions.</li>
+ *   <li>{@link PresentationDriver} is the seam between them. In production the
+ *       real implementation lives in the JS/HTML UI (Web Audio chime, dialog
+ *       overlay, timers); here an in-process {@link SimulatedDriver} lets the
+ *       whole flow run headlessly for testing.</li>
+ * </ul>
+ *
+ * <p>"Lost in Translation" triggers ONLY on genuine failures (render exception,
+ * malformed message), never on user impatience, so it keeps its meaning as a
+ * character beat rather than an annoyance.</p>
+ *
+ * <p><strong>Run:</strong> {@code javac DeliveryAdapter.java && java DeliveryAdapter}</p>
+ */
+public final class DeliveryAdapter {
+
+    // =====================================================================
+    // CoachMessage — minimal contract shared with Module 3b(1).
+    // (In the real build this is imported from org.openchess.rookie.message;
+    //  duplicated here so this file stands alone.)
+    // =====================================================================
+
+    public enum MessageType {
+        BLUNDER("Blunder"), INACCURACY("Inaccuracy"), BRILLIANT("Brilliant move"),
+        THEORY_NOTE("Theory note"), TACTIC_MISSED("Missed tactic"),
+        SUMMARY("Game summary"), ENCOURAGEMENT("Encouragement");
+        private final String label;
+        MessageType(String l) { this.label = l; }
+        public String label() { return label; }
+    }
+
+    public enum MessagePriority {
+        LOW(0), MEDIUM(1), HIGH(2);
+        private final int rank;
+        MessagePriority(int r) { this.rank = r; }
+        public int rank() { return rank; }
+    }
+
+    /** Immutable unit handed to the delivery layer. Carries a stable id. */
+    public static final class CoachMessage {
+        public static final int GLOBAL_MOVE_INDEX = -1;
+
+        private final int id;
+        private final int moveIndex;
+        private final MessageType type;
+        private final MessagePriority priority;
+        private final String rawText;
+        private final List<String> keySquares;
+
+        CoachMessage(int id, int moveIndex, MessageType type,
+                     MessagePriority priority, String rawText, List<String> keySquares) {
+            this.id = id;
+            this.moveIndex = moveIndex;
+            this.type = type;
+            this.priority = priority != null ? priority : defaultPriority(type);
+            this.rawText = rawText == null ? "" : rawText;
+            this.keySquares = keySquares == null ? List.of() : List.copyOf(keySquares);
+        }
+
+        public static MessagePriority defaultPriority(MessageType t) {
+            switch (t) {
+                case BLUNDER: case SUMMARY: return MessagePriority.HIGH;
+                case BRILLIANT: case INACCURACY: case TACTIC_MISSED: return MessagePriority.MEDIUM;
+                default: return MessagePriority.LOW;
+            }
+        }
+
+        public int id() { return id; }
+        public int moveIndex() { return moveIndex; }
+        public MessageType type() { return type; }
+        public MessagePriority priority() { return priority; }
+        public String rawText() { return rawText; }
+        public List<String> keySquares() { return keySquares; }
+        public boolean isGlobal() { return moveIndex == GLOBAL_MOVE_INDEX; }
+
+        @Override public String toString() {
+            String where = isGlobal() ? "global" : ("move " + moveIndex);
+            return "#" + id + " [" + type + "/" + priority + "@" + where + "] " + rawText;
+        }
+    }
+
+    // =====================================================================
+    // Config — tunables
+    // =====================================================================
+
+    public static final class DeliveryConfig {
+        private final long tapTimeoutMs;
+        private final long transitionMs;
+        private final long fadeMs;
+        private final long rechimeCooldownMs;
+        private final int maxRechimes;
+        private final Map<MessagePriority, List<String>> chimeByPriority;
+
+        private DeliveryConfig(Builder b) {
+            this.tapTimeoutMs = b.tapTimeoutMs;
+            this.transitionMs = b.transitionMs;
+            this.fadeMs = b.fadeMs;
+            this.rechimeCooldownMs = b.rechimeCooldownMs;
+            this.maxRechimes = b.maxRechimes;
+            this.chimeByPriority = Map.copyOf(b.chimeByPriority);
+        }
+
+        public long tapTimeoutMs() { return tapTimeoutMs; }
+        public long transitionMs() { return transitionMs; }
+        public long fadeMs() { return fadeMs; }
+        public long rechimeCooldownMs() { return rechimeCooldownMs; }
+        public int maxRechimes() { return maxRechimes; }
+        public List<String> chimePattern(MessagePriority p) { return chimeByPriority.getOrDefault(p, List.of("ping")); }
+
+        public static DeliveryConfig defaults() { return new Builder().build(); }
+        public static Builder builder() { return new Builder(); }
+
+        public static final class Builder {
+            private long tapTimeoutMs = 8000;
+            private long transitionMs = 600;
+            private long fadeMs = 400;
+            private long rechimeCooldownMs = 15000;
+            private int maxRechimes = 2;
+            private Map<MessagePriority, List<String>> chimeByPriority = new LinkedHashMap<>();
+
+            public Builder tapTimeoutMs(long v) { this.tapTimeoutMs = v; return this; }
+            public Builder transitionMs(long v) { this.transitionMs = v; return this; }
+            public Builder fadeMs(long v) { this.fadeMs = v; return this; }
+            public Builder rechimeCooldownMs(long v) { this.rechimeCooldownMs = v; return this; }
+            public Builder maxRechimes(int v) { this.maxRechimes = v; return this; }
+            public Builder chimeFor(MessagePriority p, List<String> pattern) {
+                this.chimeByPriority.put(p, pattern); return this;
+            }
+            public DeliveryConfig build() {
+                if (chimeByPriority.isEmpty()) {
+                    chimeByPriority.put(MessagePriority.HIGH, List.of("ping", "ping"));
+                    chimeByPriority.put(MessagePriority.MEDIUM, List.of("ping"));
+                    chimeByPriority.put(MessagePriority.LOW, List.of("tick"));
+                }
+                return new DeliveryConfig(this);
+            }
+        }
+    }
+
+    // =====================================================================
+    // Engagement log — feeds PreferenceTracker (Module 3b(2))
+    // =====================================================================
+
+    /** Records how the user engaged with each delivered message. */
+    public static final class EngagementLog {
+        private final Map<Integer, Long> revealedAt = new LinkedHashMap<>();
+        private final Map<Integer, Long> dwellTime = new LinkedHashMap<>();
+        private final List<Integer> skippedIds = new ArrayList<>();
+        private final List<Integer> erroredIds = new ArrayList<>();
+        private final AtomicInteger totalChimes = new AtomicInteger();
+        private final AtomicInteger ignoredChimes = new AtomicInteger();
+
+        public void recordChime() { totalChimes.incrementAndGet(); }
+        public void recordIgnoredChime() { ignoredChimes.incrementAndGet(); }
+        public void recordRevealed(int messageId) { revealedAt.put(messageId, System.nanoTime()); }
+        public void recordDwell(int messageId, long nanos) { dwellTime.put(messageId, nanos); }
+        public void recordSkipped(int messageId) { skippedIds.add(messageId); }
+        public void recordError(int messageId) { erroredIds.add(messageId); }
+
+        public int totalChimes() { return totalChimes.get(); }
+        public int ignoredChimes() { return ignoredChimes.get(); }
+        public List<Integer> skippedIds() { return List.copyOf(skippedIds); }
+        public List<Integer> erroredIds() { return List.copyOf(erroredIds); }
+        public long dwellNanos(int messageId) { return dwellTime.getOrDefault(messageId, 0L); }
+
+        /** Fraction of chimes the user actually tapped. Higher = more engaged. */
+        public double tapRate() {
+            int t = totalChimes.get();
+            return t == 0 ? 1.0 : (double)(t - ignoredChimes.get()) / t;
+        }
+    }
+
+    // =====================================================================
+    // Presentation Driver — the seam to the real UI.
+    // Implementations push audio/visual events and report user actions back.
+    // =====================================================================
+
+    public interface PresentationDriver {
+        /** Play a chime according to the given sound pattern (e.g. ["ping","ping"]). */
+        void playChime(List<String> pattern);
+        /** Show a subtle tap hint on the Rookie sprite. */
+        void showTapHint();
+        /** Begin the "activating translator…" transition. */
+        void startTransition();
+        /** Render the revealed message body and highlight key squares. */
+        void renderMessage(CoachMessage m);
+        /** Fade the dialog out. */
+        void fadeOut();
+        /** Show the "Lost in Translation" error card. */
+        void showError();
+        /** Signal that the whole session has ended. */
+        void sendSessionEnd();
+
+        // ---- user-action callbacks (invoked by the real UI / simulator) ----
+        void onTapRookie();
+        void onDismiss();
+        void onRetry();
+        void onSkip();
+    }
+
+    // =====================================================================
+    // State Machine — presentation-side states & transitions
+    // =====================================================================
+
+    public enum State { IDLE, CHIMED, ACTIVATING, REVEALED, ERROR, DISMISSING }
+
+    /**
+     * Drives the presentation states. Delegates actual effects to a
+     * {@link PresentationDriver} and reports readiness back to the
+     * {@link DeliveryAdapter}. Timers are abstracted via {@link TimerHandle}
+     * so the same logic works with real async timers (JS) or simulated ones.
+     */
+    public static final class StateMachine {
+        private final DeliveryAdapter adapter;
+        private final PresentationDriver driver;
+        private final DeliveryConfig config;
+        private volatile State state = State.IDLE;
+        private CoachMessage current;
+        private TimerHandle pendingTimer;
+
+        StateMachine(DeliveryAdapter adapter, PresentationDriver driver, DeliveryConfig config) {
+            this.adapter = adapter;
+            this.driver = driver;
+            this.config = config;
+        }
+
+        public State state() { return state; }
+
+        /** Called by the adapter when it wants to fire the next chime. */
+        void fireNext(CoachMessage msg) {
+            if (state != State.IDLE) return;
+            current = msg;
+            setState(State.CHIMED);
+            driver.playChime(config.chimePattern(msg.priority()));
+            driver.showTapHint();
+            schedule(config.tapTimeoutMs, this::onTapTimeout);
+        }
+
+        private void onTapTimeout() {
+            if (state != State.CHIMED) return;
+            adapter.onChimeIgnored(current);   // adapter decides re-chime vs drop
+            setState(State.IDLE);
+        }
+
+        // ---- driver callbacks ----
+        @Override public void onTapRookie() {
+            if (state != State.CHIMED) return;
+            cancelPending();
+            setState(State.ACTIVATING);
+            driver.startTransition();
+            schedule(config.transitionMs(), this::onTransitionDone);
+        }
+
+        private void onTransitionDone() {
+            if (state != State.ACTIVATING) return;
+            try {
+                driver.renderMessage(current);
+                setState(State.REVEALED);
+                adapter.onRevealed(current);
+            } catch (RuntimeException ex) {
+                enterError(ex.getMessage());
+            }
+        }
+
+        @Override public void onDismiss() {
+            if (state != State.REVEALED) return;
+            beginDismiss();
+        }
+
+        private void beginDismiss() {
+            setState(State.DISMISSING);
+            driver.fadeOut();
+            schedule(config.fadeMs(), () -> {
+                setState(State.IDLE);
+                adapter.advanceToNext();
+            });
+        }
+
+        private void enterError(String reason) {
+            setState(State.ERROR);
+            driver.showError();
+            if (current != null) adapter.onError(current, reason);
+        }
+
+        @Override public void onRetry() {
+            if (state != State.ERROR) return;
+            setState(State.ACTIVATING);
+            driver.startTransition();
+            schedule(config.transitionMs(), this::onTransitionDone);
+        }
+
+        @Override public void onSkip() {
+            if (state != State.ERROR) return;
+            if (current != null) adapter.onSkipped(current);
+            setState(State.DISMISSING);
+            driver.fadeOut();
+            schedule(config.fadeMs(), () -> {
+                setState(State.IDLE);
+                adapter.advanceToNext();
+            });
+        }
+
+        // ---- timer plumbing ----
+        private void schedule(long ms, Runnable action) {
+            cancelPending();
+            pendingTimer = adapter.timers().schedule(ms, action);
+        }
+        private void cancelPending() {
+            if (pendingTimer != null) { pendingTimer.cancel(); pendingTimer = null; }
+        }
+        private void setState(State s) { state = s; }
+    }
+
+    // =====================================================================
+    // Timer abstraction — real async in prod, simulated in the demo
+    // =====================================================================
+
+    public interface TimerHandle { void cancel(); }
+
+    public interface TimerService {
+        TimerHandle schedule(long delayMs, Runnable action);
+    }
+
+    // =====================================================================
+    // Delivery Adapter — scheduling core (WHAT + WHEN)
+    // =====================================================================
+
+    private final DeliveryConfig config;
+    private final EngagementLog engagement;
+    private final PriorityQueue<CoachMessage> queue;
+    private CoachMessage pendingSummary;
+    private final Map<Integer, Integer> rechimeCount = new LinkedHashMap<>();
+    private boolean sessionActive;
+    private final TimerService timers;
+    private final StateMachine machine;
+
+    public DeliveryAdapter(List<CoachMessage> messages, DeliveryConfig config,
+                           PresentationDriver driver, TimerService timers) {
+        this.config = config != null ? config : DeliveryConfig.defaults();
+        this.engagement = new EngagementLog();
+        this.timers = timers;
+        this.queue = new PriorityQueue<>(Comparator
+                .comparingInt((CoachMessage m) -> m.isGlobal() ? Integer.MAX_VALUE : m.moveIndex())
+                .thenComparing(m -> -m.priority().rank()));
+        this.machine = new StateMachine(this, driver, this.config);
+
+        for (CoachMessage m : messages) {
+            if (m.isGlobal() && m.type() == MessageType.SUMMARY) pendingSummary = m;
+            else queue.offer(m);
+        }
+        this.sessionActive = true;
+    }
+
+    /** Kick off the session; called once after construction. */
+    public void start() {
+        if (!sessionActive) return;
+        advanceToNext();
+    }
+
+    // ---- adapter hooks invoked by the state machine ----
+
+    void advanceToNext() {
+        if (!sessionActive) return;
+        if (queue.isEmpty() && pendingSummary != null) {
+            queue.offer(pendingSummary);
+            pendingSummary = null;
+        }
+        if (queue.isEmpty()) { endSession(); return; }
+        CoachMessage next = queue.peek();
+        engagement.recordChime();
+        machine.fireNext(next);
+    }
+
+    void onRevealed(CoachMessage m) {
+        queue.poll();                       // remove the just-revealed message
+        engagement.recordRevealed(m.id());
+    }
+
+    void onChimeIgnored(CoachMessage m) {
+        engagement.recordIgnoredChime();
+        int count = rechimeCount.merge(m.id(), 1, Integer::sum);
+        if (count < config.maxRechimes()) {
+            // Re-chime after cooldown (message stays queued).
+            timers.schedule(config.rechimeCooldownMs(), () -> {
+                if (sessionActive && !queue.isEmpty() && queue.peek().id() == m.id()) {
+                    engagement.recordChime();
+                    machine.fireNext(m);
+                }
+            });
+        } else {
+            // Give up: fold into summary's "also worth reviewing".
+            queue.poll();
+            engagement.recordSkipped(m.id());
+            if (pendingSummary == null) attachOverflowNote(m);
+        }
+    }
+
+    void onSkipped(CoachMessage m) {
+        queue.poll();
+        engagement.recordSkipped(m.id());
+    }
+
+    void onError(CoachMessage m, String reason) {
+        engagement.recordError(m.id());
+        // Message remains queued; retry re-attempts the same message.
+    }
+
+    private void endSession() {
+        sessionActive = false;
+        machine.sendSessionEndSafe();
+    }
+
+    // ---- overflow bookkeeping for dropped messages ----
+    private final List<Integer> overflowMoves = new ArrayList<>();
+    private void attachOverflowNote(CoachMessage m) { overflowMoves.add(m.moveIndex()); }
+    public List<Integer> overflowMoves() { return List.copyOf(overflowMoves); }
+
+    // ---- accessors ----
+    public EngagementLog engagement() { return engagement; }
+    public StateMachine machine() { return machine; }
+    public TimerService timers() { return timers; }
+    public boolean isActive() { return sessionActive; }
+
+    // helper used by StateMachine.endSession path
+    void sendSessionEndSafe() { /* routed through driver inside machine */ }
+
+    // =====================================================================
+    // Simulated PresentationDriver — in-process stand-in for the JS UI
+    // =====================================================================
+
+    /** Logs every presentation event so the demo can print the full flow. */
+    public static final class SimulatedDriver implements PresentationDriver {
+        private final List<String> log = new ArrayList<>();
+        private final StateMachine sm;
+
+        public SimulatedDriver(StateMachine sm) { this.sm = sm; }
+
+        private void add(String s) { log.add(s); System.out.println("   | " + s); }
+
+        @Override public void playChime(List<String> p) { add("🔔 chime: " + String.join("+", p)); }
+        @Override public void showTapHint() { add("✨ tap hint shown on Rookie"); }
+        @Override public void startTransition() { add("⏳ \"activating translator…\""); }
+        @Override public void renderMessage(CoachMessage m) {
+            add("💬 revealed: " + m.rawText());
+            if (!m.keySquares().isEmpty()) add("   ⌗ highlight: " + String.join(", ", m.keySquares()));
+        }
+        @Override public void fadeOut() { add("↘ fading out"); }
+        @Override public void showError() { add("❓ \"Lost in Translation\""); }
+        @Override public void sendSessionEnd() { add("■ SESSION END"); }
+
+        @Override public void onTapRookie() { add("👆 user tapped Rookie"); sm.onTapRookie(); }
+        @Override public void onDismiss() { add("✕ user dismissed"); sm.onDismiss(); }
+        @Override public void onRetry() { add("⟳ user retried"); sm.onRetry(); }
+        @Override public void onSkip() { add("⤼ user skipped"); sm.onSkip(); }
+
+        public List<String> log() { return log; }
+    }
+
+    // =====================================================================
+    // Simulated TimerService — runs scheduled actions synchronously in order
+    // =====================================================================
+
+    /** Executes timers deterministically for headless testing. */
+    public static final class SimulatedTimers implements TimerService {
+        public static final class Handle implements TimerHandle {
+            private final Runnable action; private boolean cancelled;
+            Handle(Runnable a) { this.action = a; }
+            @Override public void cancel() { cancelled = true; }
+            void fire() { if (!cancelled) action.run(); }
+        }
+        private final List<Handle> pending = new ArrayList<>();
+
+        @Override public TimerHandle schedule(long delayMs, Runnable action) {
+            Handle h = new Handle(action);
+            pending.add(h);
+            return h;
+        }
+        /** Fire all currently-pending timers (used by the demo harness). */
+        public void flushAll() {
+            while (!pending.isEmpty()) {
+                Handle h = pending.remove(0);
+                h.fire();
+            }
+        }
+    }
+
+    // =====================================================================
+    // Demo entry point
+    // =====================================================================
+
+    public static void main(String[] args) {
+        System.out.println("=== Rookie · Delivery Flow (simulated) ===\n");
+
+        // A handful of messages as if produced by Module 3b(1).
+        List<CoachMessage> msgs = new ArrayList<>();
+        int id = 1;
+        msgs.add(new CoachMessage(id++, 3,  MessageType.THEORY_NOTE,   null,
+                "Around move 3 you stepped away from the Caro-Kann Defence (B12).", List.of()));
+        msgs.add(new CoachMessage(id++, 14, MessageType.BLUNDER,       null,
+                "Move 14 cost roughly 2.3 pawns. Position swung sharply against you.", List.of("d5")));
+        msgs.add(new CoachMessage(id++, 20, MessageType.BRILLIANT,     null,
+                "Move 20 was a strong choice — it improved your position notably.", List.of()));
+        msgs.add(new CoachMessage(id++, 26, MessageType.TACTIC_MISSED, null,
+                "On move 26 there was a fork available: knight fork on f2.", List.of("f2")));
+        msgs.add(new CoachMessage(id++, CoachMessage.GLOBAL_MOVE_INDEX, MessageType.SUMMARY, null,
+                "You won. Pivotal moment around move 14. Focus on avoiding flagged mistakes.", List.of()));
+
+        DeliveryConfig cfg = DeliveryConfig.builder()
+                .tapTimeoutMs(8000).transitionMs(600).fadeMs(400)
+                .rechimeCooldownMs(15000).maxRechimes(2)
+                .build();
+
+        SimulatedTimers timers = new SimulatedTimers();
+        // We need the driver to reference the machine, which references the adapter,
+        // which needs the driver — resolve with a tiny holder.
+        Holder h = new Holder();
+        DeliveryAdapter adapter = new DeliveryAdapter(msgs, cfg, h.driverPlaceholder, timers);
+        h.driverPlaceholder.setDelegate(adapter.machine());
+        SimulatedDriver driver = new SimulatedDriver(adapter.machine());
+        h.driverPlaceholder.attach(driver);
+
+        adapter.start();
+
+        // Script the user: tap every chime, dismiss every reveal, skip nothing.
+        driveUser(timers, adapter, driver);
+
+        System.out.println("\n--- Engagement ---");
+        EngagementLog e = adapter.engagement();
+        System.out.printf("chimes=%d ignored=%d tapRate=%.2f%n",
+                e.totalChimes(), e.ignoredChimes(), e.tapRate());
+    }
+
+    /** Advance the simulation: fire timers, then simulate a tap/dismiss per cycle. */
+    private static void driveUser(SimulatedTimers timers, DeliveryAdapter adapter, SimulatedDriver driver) {
+        int guard = 0;
+        while (adapter.isActive() && guard++ < 50) {
+            timers.flushAll();                 // let transitions/dism
