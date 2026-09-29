@@ -1,0 +1,400 @@
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Module 3b(2) — Rookie Persona Adapter.
+ *
+ * <p>The final core sub-module of the Rookie dialogue stack. It sits between
+ * the Message Generator (3b(1)) and the Delivery Adapter (3b(3)), taking
+ * factual {@link CoachMessage}s and reshaping their text to match how the user
+ * wants to be coached.</p>
+ *
+ * <p><strong>The "one model fits all" design</strong></p>
+ * Rather than a menu of discrete personalities (spring commentator vs. Rozman),
+ * adaptation happens along TWO continuous dials:</p>
+ * <ul>
+ *   <li><strong>Directness</strong> (0..1): blunt correction &harr; gentle nudge / Socratic question.</li>
+ *   <li><strong>Density</strong> (0..1): terse one-liner &harr; detailed explanation.</li>
+ * </ul>
+ * <p>A point in this 2-D space covers the whole personality spectrum smoothly,
+ * and adapting means nudging a value, not swapping a character.</p>
+ *
+ * <p><strong>Adaptation sources</strong></p>
+ * <ul>
+ *   <li>Implicit: engagement signals from the delivery layer (tap rate, dwell
+ *       time, skips) via {@link PreferenceTracker}.</li>
+ *   <li>Explicit (optional): a single thumbs up/down after a session.</li>
+ * </ul>
+ * <p>Adaptation is per-session with a thin persistent memory of coarse dials,
+ * so each game gets a fresh read while long-term tendencies carry over.</p>
+ *
+ * <p><strong>Run:</strong> {@code javac PersonaAdapter.java && java PersonaAdapter}</p>
+ */
+public final class PersonaAdapter {
+
+    // =====================================================================
+    // Minimal CoachMessage contract (shared with 3b(1); duplicated for standalone build)
+    // =====================================================================
+
+    public enum MessageType {
+        BLUNDER("Blunder"), INACCURACY("Inaccuracy"), BRILLIANT("Brilliant move"),
+        THEORY_NOTE("Theory note"), TACTIC_MISSED("Missed tactic"),
+        SUMMARY("Game summary"), ENCOURAGEMENT("Encouragement");
+        private final String label;
+        MessageType(String l) { this.label = l; }
+        public String label() { return label; }
+    }
+
+    public static final class CoachMessage {
+        public static final int GLOBAL_MOVE_INDEX = -1;
+        private final int id;
+        private final int moveIndex;
+        private final MessageType type;
+        private final String rawText;      // FACTUAL text from 3b(1)
+        private final List<String> keySquares;
+
+        public CoachMessage(int id, int moveIndex, MessageType type, String rawText, List<String> keySquares) {
+            this.id = id;
+            this.moveIndex = moveIndex;
+            this.type = type;
+            this.rawText = rawText == null ? "" : rawText;
+            this.keySquares = keySquares == null ? List.of() : List.copyOf(keySquares);
+        }
+        public int id() { return id; }
+        public int moveIndex() { return moveIndex; }
+        public MessageType type() { return type; }
+        public String rawText() { return rawText; }
+        public List<String> keySquares() { return keySquares; }
+        public boolean isGlobal() { return moveIndex == GLOBAL_MOVE_INDEX; }
+    }
+
+    /** A message after persona adaptation has been applied. */
+    public static final class AdaptedMessage {
+        private final CoachMessage source;
+        private final String adaptedText;
+        private final double directnessUsed;
+        private final double densityUsed;
+
+        public AdaptedMessage(CoachMessage source, String adaptedText, double d, double den) {
+            this.source = source;
+            this.adaptedText = adaptedText;
+            this.directnessUsed = d;
+            this.densityUsed = den;
+        }
+        public CoachMessage source() { return source; }
+        public String adaptedText() { return adaptedText; }
+        public double directnessUsed() { return directnessUsed; }
+        public double densityUsed() { return densityUsed; }
+
+        @Override public String toString() {
+            return String.format("[d=%.2f den=%.2f] %s", directnessUsed, densityUsed, adaptedText);
+        }
+    }
+
+    // =====================================================================
+    // Persona state — the two dials + persistence
+    // =====================================================================
+
+    /** Current persona settings. Both dials are clamped to [0,1]. */
+    public static final class PersonaState {
+        private double directness;   // 0 = gentle/questioning, 1 = blunt
+        private double density;      // 0 = terse, 1 = detailed
+
+        public PersonaState(double directness, double density) {
+            this.directness = clamp(directness);
+            this.density = clamp(density);
+        }
+        public double directness() { return directness; }
+        public double density() { return density; }
+        public void setDirectness(double v) { this.directness = clamp(v); }
+        public void setDensity(double v) { this.density = clamp(v); }
+        public PersonaState copy() { return new PersonaState(directness, density); }
+
+        private static double clamp(double v) { return Math.max(0.0, Math.min(1.0, v)); }
+
+        /** Coarse labels for the persistent memory (avoids storing float drift). */
+        public String directnessBand() {
+            if (directness < 0.34) return "gentle";
+            if (directness < 0.67) return "balanced";
+            return "blunt";
+        }
+        public String densityBand() {
+            if (density < 0.34) return "terse";
+            if (density < 0.67) return "moderate";
+            return "detailed";
+        }
+    }
+
+    /** Thin persistent store of coarse preference bands (survives sessions). */
+    public static final class PreferenceMemory {
+        private String directnessBand = "balanced";
+        private String densityBand = "moderate";
+
+        public void remember(PersonaState s) {
+            this.directnessBand = s.directnessBand();
+            this.densityBand = s.densityBand();
+        }
+        /** Seed a fresh session from persisted bands. */
+        public PersonaState seed() {
+            double d = switch (directnessBand) { case "gentle" -> 0.2; case "blunt" -> 0.85; default -> 0.5; };
+            double den = switch (densityBand) { case "terse" -> 0.2; case "detailed" -> 0.85; default -> 0.5; };
+            return new PersonaState(d, den);
+        }
+        public String describe() { return directnessBand + "/" + densityBand; }
+    }
+
+    // =====================================================================
+    // Engagement snapshot — produced by the delivery layer (3b(3))
+    // =====================================================================
+
+    /** Signals the tracker learns from, harvested at session boundaries. */
+    public record EngagementSnapshot(double tapRate, long avgDwellMs, int skippedCount, int totalMessages) {}
+
+    // =====================================================================
+    // Preference Tracker — turns signals into dial adjustments
+    // =====================================================================
+
+    public static final class PreferenceTracker {
+        private final PreferenceMemory memory;
+
+        public PreferenceTracker(PreferenceMemory memory) { this.memory = memory; }
+
+        /** Start a session seeded from whatever was persisted last time. */
+        public PersonaState beginSession() { return memory.seed(); }
+
+        /**
+         * Mid/end-of-session adjustment from observed engagement.
+         * Rules are intentionally conservative — small nudges, never jumps.
+         */
+        public PersonaState adapt(PersonaState current, EngagementSnapshot sig) {
+            PersonaState p = current.copy();
+
+            // Low tap rate => user isn't engaging with frequent chimes.
+            // Interpret as "too much noise": reduce density slightly.
+            if (sig.totalMessages() > 0 && sig.tapRate() < 0.5) {
+                p.setDensity(p.density() - 0.1);
+            }
+
+            // Long dwell => user reads carefully; they can handle more detail.
+            if (sig.avgDwellMs() > 9000) {
+                p.setDensity(p.density() + 0.1);
+            }
+
+            // Many skips => messages feel irrelevant/too long; get terser.
+            if (sig.skippedCount() >= 2) {
+                p.setDensity(p.density() - 0.15);
+            }
+
+            memory.remember(p);
+            return p;
+        }
+
+        /** Optional explicit feedback: one thumb after a session. */
+        public PersonaState applyFeedback(PersonaState current, boolean helpful) {
+            PersonaState p = current.copy();
+            if (helpful) {
+                // Reinforce: no change (the current mix worked).
+            } else {
+                // Not helpful: pull toward the gentler, terser corner as a safe retreat.
+                p.setDirectness(p.directness() - 0.15);
+                p.setDensity(p.density() - 0.15);
+            }
+            memory.remember(p);
+            return p;
+        }
+
+        public PreferenceMemory memory() { return memory; }
+    }
+
+    // =====================================================================
+    // Rewrite Engine — the heart: factual text -> persona-shaped text
+    // =====================================================================
+
+    /**
+     * Transforms a factual {@link CoachMessage} according to the two dials.
+     *
+     * <p>Strategy: pick a FRAMING based on directness, then trim or expand
+     * based on density. Because the source text is already factual, we operate
+     * on its structure (leading clause, trailing detail) rather than inventing
+     * new analysis — the adapter changes HOW it's said, never WHAT is claimed.</p>
+     */
+    public static final class RewriteEngine {
+
+        public AdaptedMessage adapt(CoachMessage m, PersonaState p) {
+            String shaped = shapeByDirectness(m, p.directness());
+            shaped = shapeByDensity(shaped, m, p.density());
+            return new AdaptedMessage(m, shaped.trim(), p.directness(), p.density());
+        }
+
+        // ---- DIRECTNESS axis -------------------------------------------
+        private String shapeByDirectness(CoachMessage m, double d) {
+            String base = m.rawText();
+            switch (m.type()) {
+                case BLUNDER:
+                case INACCURACY:
+                    if (d < 0.34) {
+                        // Gentle / Socratic: pose it as something to notice.
+                        return soften(base, "Worth a second look: ");
+                    } else if (d < 0.67) {
+                        return base; // balanced: factual as-is
+                    } else {
+                        // Blunt: lead with the cost.
+                        return "That one hurt. " + capitalize(firstSentence(base));
+                    }
+                case BRILLIANT:
+                    if (d < 0.34) return "Nice — you spotted something good there.";
+                    if (d < 0.67) return base;
+                    return "Strong. Exactly the kind of move to bank.";
+                case TACTIC_MISSED:
+                    if (d < 0.34) return "Did you catch the chance around here? ";
+                    if (d < 0.67) return base;
+                    return "You left a tactic on the board. ";
+                case THEORY_NOTE:
+                    if (d < 0.34) return "Heads-up on the opening line: ";
+                    if (d < 0.67) return base;
+                    return "Off-book there. ";
+                case SUMMARY:
+                    return base; // summaries stay neutral regardless of tone
+                default:
+                    return base;
+            }
+        }
+
+        // ---- DENSITY axis ----------------------------------------------
+        private String shapeByDensity(String shaped, CoachMessage m, double den) {
+            if (den < 0.34) {
+                // Terse: keep only the first short clause.
+                String t = firstClause(shaped);
+                return t.isEmpty() ? shaped : t;
+            } else if (den > 0.67) {
+                // Detailed: append focus-square context if available.
+                if (!m.keySquares().isEmpty()) {
+                    return shaped + " Focus: " + String.join(", ", m.keySquares()) + ".";
+                }
+                return shaped;
+            }
+            return shaped; // moderate: leave shaped text alone
+        }
+
+        // ---- small string helpers --------------------------------------
+        private String soften(String base, String prefix) {
+            String body = stripTrailingPeriod(base);
+            return prefix + lowercaseFirst(body) + "?";
+        }
+        private String firstSentence(String s) {
+            int dot = indexOfAny(s, ".!?");
+            return dot > 0 ? s.substring(0, dot + 1) : s;
+        }
+        private String firstClause(String s) {
+            int semi = s.indexOf(';');
+            int comma = s.indexOf(',');
+            int cut = -1;
+            if (semi > 0 && (comma < 0 || semi < comma)) cut = semi;
+            else if (comma > 0) cut = comma;
+            if (cut > 0 && cut < 60) return s.substring(0, cut);
+            return firstSentence(s);
+        }
+        private String stripTrailingPeriod(String s) {
+            return s.endsWith(".") ? s.substring(0, s.length() - 1) : s;
+        }
+        private String capitalize(String s) {
+            return s.isEmpty() ? s : Character.toUpperCase(s.charAt(0)) + s.substring(1);
+        }
+        private String lowercaseFirst(String s) {
+            return s.isEmpty() ? s : Character.toLowerCase(s.charAt(0)) + s.substring(1);
+        }
+        private int indexOfAny(String s, String chars) {
+            for (int i = 0; i < s.length(); i++) if (chars.indexOf(s.charAt(i)) >= 0) return i;
+            return -1;
+        }
+    }
+
+    // =====================================================================
+    // Top-level facade — what callers use
+    // =====================================================================
+
+    private final PreferenceTracker tracker;
+    private final RewriteEngine engine;
+    private PersonaState state;
+
+    public PersonaAdapter(PreferenceMemory memory) {
+        this.tracker = new PreferenceTracker(memory);
+        this.engine = new RewriteEngine();
+        this.state = tracker.beginSession();
+    }
+
+    /** Adapt every incoming message for the current session persona. */
+    public List<AdaptedMessage> adaptAll(List<CoachMessage> messages) {
+        List<AdaptedMessage> out = new ArrayList<>();
+        for (CoachMessage m : messages) out.add(engine.adapt(m, state));
+        return out;
+    }
+
+    /** Feed engagement back in mid/end of session; returns updated state. */
+    public PersonaState learnFrom(EngagementSnapshot sig) {
+        state = tracker.adapt(state, sig);
+        return state;
+    }
+
+    /** Apply an explicit thumbs up/down. */
+    public PersonaState giveFeedback(boolean helpful) {
+        state = tracker.applyFeedback(state, helpful);
+        return state;
+    }
+
+    public PersonaState currentState() { return state.copy(); }
+
+    // =====================================================================
+    // Demo entry point
+    // =====================================================================
+
+    public static void main(String[] args) {
+        System.out.println("=== Rookie · Persona Adapter (Module 3b(2)) ===\n");
+
+        // Factual messages as produced by 3b(1).
+        List<CoachMessage> msgs = new ArrayList<>();
+        int id = 1;
+        msgs.add(new CoachMessage(id++, 14, MessageType.BLUNDER,
+                "Move 14 cost roughly 2.3 pawns. Position swung sharply against you.", List.of("d5")));
+        msgs.add(new CoachMessage(id++, 20, MessageType.BRILLIANT,
+                "Move 20 was a strong choice — it improved your position notably.", List.of()));
+        msgs.add(new CoachMessage(id++, 26, MessageType.TACTIC_MISSED,
+                "On move 26 there was a fork available: knight fork on f2 attacking king and queen.", List.of("f2")));
+        msgs.add(new CoachMessage(id++, 3, MessageType.THEORY_NOTE,
+                "Around move 3 you stepped away from the Caro-Kann Defence (B12).", List.of()));
+
+        PreferenceMemory mem = new PreferenceMemory();
+        PersonaAdapter pa = new PersonaAdapter(mem);
+
+        // Scenario A: default balanced/moderate persona.
+        printBlock("A) Balanced / Moderate (default)", pa.adaptAll(msgs));
+
+        // Simulate: user ignores half the chimes and dwells long => denser but calmer.
+        pa.learnFrom(new EngagementSnapshot(0.4, 12000, 0, 4));
+        printBlock("B) After low tap-rate + long dwell", pa.adaptAll(msgs));
+
+        // Force a blunt/detailed corner manually to show the full range.
+        pa.currentState().setDirectness(0.9);
+        pa.currentState().setDensity(0.9);
+        printBlock("C) Blunt / Detailed (Rozman-ish)", pa.adaptAll(msgs));
+
+        // Force a gentle/terse corner.
+        pa.currentState().setDirectness(0.1);
+        pa.currentState().setDensity(0.1);
+        printBlock("D) Gentle / Terse (soft coach)", pa.adaptAll(msgs));
+
+        // Explicit negative feedback pulls toward gentle+terse.
+        pa.giveFeedback(false);
+        System.out.printf("%nPersisted preference band: %s%n", mem.describe());
+    }
+
+    private static void printBlock(String title, List<AdaptedMessage> list) {
+        System.out.println("--- " + title + " ---");
+        for (AdaptedMessage a : list) {
+            System.out.printf("  %-11s %s%n", a.source().type(), a.adaptedText());
+        }
+        System.out.println();
+    }
+}
