@@ -1,0 +1,663 @@
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Module 3c — Luminaries: the Brilliant Move Counter, complete.
+ *
+ * <p>One module, two parts:</p>
+ * <ul>
+ *   <li><strong>Part 1 — Ledger &amp; FEN generator:</strong> for every brilliant
+ *       move detected on the platform, extracts the FEN of the position BEFORE
+ *       the move, stores it as a lifetime menu entry per player, and keeps the
+ *       lifetime counter (+1 per NEW entry, deduplicated so a re-analysed game
+ *       never double-counts). File-backed, Codex-style persistence.</li>
+ *   <li><strong>Part 2 — the Tab:</strong> the menu itself. Header shows the
+ *       lifetime count; each entry renders as an AI-written TITLE plus a
+ *       one-paragraph description subtitle; clicking a title opens an
+ *       {@link AnalysisSession} in Sagacious analysis mode seeded with the
+ *       stored FEN, and the repeat button replays the move over and over.</li>
+ * </ul>
+ *
+ * <p>Seams to the rest of OpenChess (implement these for production):</p>
+ * <ul>
+ *   <li>{@link SagaciousBridge} — loads positions/moves into the analysis board
+ *       (JS engine + Sagacious over the existing bridge/WebSocket).</li>
+ *   <li>{@link NarrativeService} — AI title + paragraph. {@link StubNarrative}
+ *       is a deterministic template stand-in; {@link PromptNarrative} carries
+ *       the exact prompt for the real Claude call.</li>
+ *   <li>Game transcripts arrive from Codex (Module 6) replay/FEN generation.</li>
+ * </ul>
+ *
+ * <p><strong>Run:</strong> {@code javac Luminaries.java && java Luminaries}</p>
+ */
+public final class Luminaries {
+
+    // =====================================================================
+    // FEN utilities
+    // =====================================================================
+
+    public static final class FenUtils {
+
+        public static final String START_POS =
+                "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+
+        private FenUtils() {}
+
+        /** Structural validation of a FEN string. Throws on anything malformed. */
+        public static void validate(String fen) {
+            if (fen == null || fen.isBlank()) {
+                throw new IllegalArgumentException("FEN is empty");
+            }
+            String[] f = fen.trim().split("\\s+");
+            if (f.length < 4) {
+                throw new IllegalArgumentException("FEN needs at least 4 fields: " + fen);
+            }
+            String[] ranks = f[0].split("/");
+            if (ranks.length != 8) {
+                throw new IllegalArgumentException("FEN board must have 8 ranks: " + fen);
+            }
+            for (String rank : ranks) {
+                int squares = 0;
+                for (char c : rank.toCharArray()) {
+                    if (Character.isDigit(c)) {
+                        int d = c - '0';
+                        if (d == 0) throw new IllegalArgumentException("FEN digit 0 invalid: " + fen);
+                        squares += d;
+                    } else if ("prnbqkPRNBQK".indexOf(c) >= 0) {
+                        squares += 1;
+                    } else {
+                        throw new IllegalArgumentException("FEN illegal piece char '" + c + "': " + fen);
+                    }
+                }
+                if (squares != 8) {
+                    throw new IllegalArgumentException("FEN rank must sum to 8 squares: " + fen);
+                }
+            }
+            if (!f[1].equals("w") && !f[1].equals("b")) {
+                throw new IllegalArgumentException("FEN side must be w/b: " + fen);
+            }
+            if (!f[2].equals("-") && !f[2].matches("[KQkq]{1,4}")) {
+                throw new IllegalArgumentException("FEN castling field invalid: " + fen);
+            }
+            if (!f[3].equals("-") && !f[3].matches("[a-h][36]")) {
+                throw new IllegalArgumentException("FEN en-passant field invalid: " + fen);
+            }
+        }
+
+        public static boolean isValid(String fen) {
+            try { validate(fen); return true; } catch (RuntimeException e) { return false; }
+        }
+    }
+
+    // =====================================================================
+    // Game transcript — minimal view of a finished game.
+    // Production: fed by Codex (Module 6) replay + per-ply FEN generation.
+    // =====================================================================
+
+    public static final class GameTranscript {
+        private final String gameId;
+        private final String whitePlayerId;
+        private final String blackPlayerId;
+        private final String startFen;
+        private final List<String> sanMoves;
+        private final List<String> fenAfterEachMove;   // index 0 = FEN after ply 1
+
+        private GameTranscript(Builder b) {
+            this.gameId = b.gameId;
+            this.whitePlayerId = b.whitePlayerId;
+            this.blackPlayerId = b.blackPlayerId;
+            this.startFen = b.startFen != null ? b.startFen : FenUtils.START_POS;
+            FenUtils.validate(this.startFen);
+            this.sanMoves = List.copyOf(b.sanMoves);
+            this.fenAfterEachMove = List.copyOf(b.fenAfterEachMove);
+            if (this.sanMoves.size() != this.fenAfterEachMove.size()) {
+                throw new IllegalArgumentException("SAN list and FEN list must align by ply");
+            }
+        }
+
+        /** FEN of the position BEFORE ply {@code ply} (1-based). Part 1 core. */
+        public String fenBeforePly(int ply) {
+            if (ply < 1 || ply > sanMoves.size()) {
+                throw new IllegalArgumentException("ply out of range: " + ply);
+            }
+            String fen = (ply == 1) ? startFen : fenAfterEachMove.get(ply - 2);
+            FenUtils.validate(fen);
+            return fen;
+        }
+
+        public String sanAt(int ply) { return sanMoves.get(ply - 1); }
+        public int plyCount() { return sanMoves.size(); }
+        public String gameId() { return gameId; }
+
+        /** Which player made ply {@code ply} (odd = White, even = Black). */
+        public String playerIdForPly(int ply) {
+            return (ply % 2 == 1) ? whitePlayerId : blackPlayerId;
+        }
+
+        public static Builder builder() { return new Builder(); }
+
+        public static final class Builder {
+            private String gameId = "unknown-game";
+            private String whitePlayerId = "";
+            private String blackPlayerId = "";
+            private String startFen;
+            private final List<String> sanMoves = new ArrayList<>();
+            private final List<String> fenAfterEachMove = new ArrayList<>();
+
+            public Builder gameId(String v) { this.gameId = v; return this; }
+            public Builder whitePlayerId(String v) { this.whitePlayerId = v; return this; }
+            public Builder blackPlayerId(String v) { this.blackPlayerId = v; return this; }
+            public Builder startFen(String v) { this.startFen = v; return this; }
+            public Builder addMove(String san, String fenAfter) {
+                this.sanMoves.add(san);
+                this.fenAfterEachMove.add(fenAfter);
+                return this;
+            }
+            public GameTranscript build() { return new GameTranscript(this); }
+        }
+    }
+
+    // =====================================================================
+    // Candidate + Entry
+    // =====================================================================
+
+    /** A brilliant move detected by analysis, before it becomes a ledger entry. */
+    public record BrilliantCandidate(String gameId, String playerId, int ply, String san,
+                                     double evalGain, String fenBefore) {
+        public BrilliantCandidate {
+            FenUtils.validate(fenBefore);
+        }
+    }
+
+    /** A permanent menu entry. */
+    public record BrilliantEntry(String entryId, String playerId, String gameId, int ply,
+                                 int moveNumber, String side, String san,
+                                 double evalGain, String fenBefore, Instant recordedAt,
+                                 String title, String description) {
+
+        /** Natural key: one moment, one entry, forever. Doubles as dedup key. */
+        public static String makeEntryId(String playerId, String gameId, int ply) {
+            return playerId + ":" + gameId + ":" + ply;
+        }
+
+        public BrilliantEntry withNarrative(String newTitle, String newDescription) {
+            return new BrilliantEntry(entryId, playerId, gameId, ply, moveNumber, side,
+                    san, evalGain, fenBefore, recordedAt, newTitle, newDescription);
+        }
+
+        public boolean hasNarrative() {
+            return title != null && !title.isBlank();
+        }
+    }
+
+    // =====================================================================
+    // Part 1 — FEN generator (extractor)
+    // =====================================================================
+
+    /** Turns (game, brilliant plies, eval map) into FEN-bearing candidates. */
+    public static final class BrilliantExtractor {
+
+        private BrilliantExtractor() {}
+
+        /**
+         * @param game           finished game transcript
+         * @param brilliantPlies plies flagged brilliant (from 3b(1)/Sagacious)
+         * @param evalByPly      White-view eval after each ply (may be partial)
+         */
+        public static List<BrilliantCandidate> extract(GameTranscript game,
+                                                       List<Integer> brilliantPlies,
+                                                       Map<Integer, Double> evalByPly) {
+            List<BrilliantCandidate> out = new ArrayList<>();
+            List<Integer> sorted = new ArrayList<>(brilliantPlies);
+            sorted.sort(Comparator.naturalOrder());
+
+            for (int ply : sorted) {
+                String fenBefore = game.fenBeforePly(ply);      // <-- the FEN generator core
+                out.add(new BrilliantCandidate(
+                        game.gameId(),
+                        game.playerIdForPly(ply),
+                        ply,
+                        game.sanAt(ply),
+                        evalGain(game, ply, evalByPly),
+                        fenBefore));
+            }
+            return out;
+        }
+
+        /** Eval gain the mover achieved: sign-adjusted delta over the previous ply. */
+        private static double evalGain(GameTranscript game, int ply, Map<Integer, Double> evalByPly) {
+            Double after = evalByPly.get(ply);
+            Double before = evalByPly.get(ply - 1);
+            if (after == null || before == null) return 0.0;
+            double sign = (ply % 2 == 1) ? 1.0 : -1.0;   // odd ply = White moved
+            return sign * (after - before);
+        }
+    }
+
+    // =====================================================================
+    // Part 1 — Ledger: lifetime store + counter, file-backed
+    // =====================================================================
+
+    public static final class Ledger {
+
+        private final Map<String, List<BrilliantEntry>> byPlayer = new LinkedHashMap<>();
+        private final Map<String, Boolean> seenIds = new LinkedHashMap<>();
+        private final Path file;   // nullable -> memory-only
+
+        public Ledger(Path file) {
+            this.file = file;
+            if (file != null) load();
+        }
+
+        /** Record a candidate. Returns true if NEW (counter +1), false if duplicate. */
+        public boolean record(BrilliantCandidate c) {
+            String id = BrilliantEntry.makeEntryId(c.playerId(), c.gameId(), c.ply());
+            if (seenIds.containsKey(id)) return false;           // dedup: no double count
+
+            BrilliantEntry e = new BrilliantEntry(
+                    id, c.playerId(), c.gameId(), c.ply(),
+                    (c.ply() + 1) / 2,
+                    (c.ply() % 2 == 1) ? "W" : "B",
+                    c.san(), c.evalGain(), c.fenBefore(),
+                    Instant.now(), "", "");
+
+            byPlayer.computeIfAbsent(c.playerId(), k -> new ArrayList<>()).add(e);
+            seenIds.put(id, Boolean.TRUE);
+            save();
+            return true;                                          // counter +1
+        }
+
+        /** Lifetime counter for one player across all platform games. */
+        public int lifetimeCount(String playerId) {
+            return byPlayer.getOrDefault(playerId, List.of()).size();
+        }
+
+        public int totalCount() { return seenIds.size(); }
+
+        /** Newest first — the natural menu order. */
+        public List<BrilliantEntry> entries(String playerId) {
+            List<BrilliantEntry> list = new ArrayList<>(byPlayer.getOrDefault(playerId, List.of()));
+            list.sort(Comparator.comparing(BrilliantEntry::recordedAt).reversed());
+            return list;
+        }
+
+        public boolean setNarrative(String playerId, String entryId, String title, String description) {
+            List<BrilliantEntry> list = byPlayer.get(playerId);
+            if (list == null) return false;
+            for (int i = 0; i < list.size(); i++) {
+                if (list.get(i).entryId().equals(entryId)) {
+                    list.set(i, list.get(i).withNarrative(title, description));
+                    save();
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        public BrilliantEntry find(String playerId, String entryId) {
+            for (BrilliantEntry e : byPlayer.getOrDefault(playerId, List.of())) {
+                if (e.entryId().equals(entryId)) return e;
+            }
+            return null;
+        }
+
+        // ---- persistence: one pipe-delimited line per entry ----------------
+
+        private void save() {
+            if (file == null) return;
+            try {
+                StringBuilder sb = new StringBuilder();
+                for (List<BrilliantEntry> list : byPlayer.values()) {
+                    for (BrilliantEntry e : list) sb.append(toLine(e)).append('\n');
+                }
+                Files.writeString(file, sb.toString());
+            } catch (IOException ex) {
+                throw new RuntimeException("ledger save failed", ex);
+            }
+        }
+
+        private void load() {
+            if (file == null || !Files.exists(file)) return;
+            try {
+                for (String line : Files.readAllLines(file)) {
+                    if (line.isBlank()) continue;
+                    BrilliantEntry e = fromLine(line);
+                    byPlayer.computeIfAbsent(e.playerId(), k -> new ArrayList<>()).add(e);
+                    seenIds.put(e.entryId(), Boolean.TRUE);
+                }
+            } catch (IOException ex) {
+                throw new RuntimeException("ledger load failed", ex);
+            }
+        }
+
+        private static String clean(String s) {
+            return (s == null ? "" : s).replace('|', '/').replace('\n', ' ').replace('\r', ' ');
+        }
+
+        private static String toLine(BrilliantEntry e) {
+            return String.join("|",
+                    e.entryId(), e.playerId(), e.gameId(),
+                    Integer.toString(e.ply()), Integer.toString(e.moveNumber()), e.side(),
+                    clean(e.san()), Double.toString(e.evalGain()), e.fenBefore(),
+                    Long.toString(e.recordedAt().getEpochSecond()),
+                    clean(e.title()), clean(e.description()));
+        }
+
+        private static BrilliantEntry fromLine(String line) {
+            String[] p = line.split("\\|", -1);
+            if (p.length < 12) throw new IllegalArgumentException("corrupt ledger line: " + line);
+            return new BrilliantEntry(p[0], p[1], p[2],
+                    Integer.parseInt(p[3]), Integer.parseInt(p[4]), p[5],
+                    p[6], Double.parseDouble(p[7]), p[8],
+                    Instant.ofEpochSecond(Long.parseLong(p[9])), p[10], p[11]);
+        }
+    }
+
+    // =====================================================================
+    // Part 2 — Narrative service (AI title + paragraph)
+    // =====================================================================
+
+    /** Generates the title + description shown on each menu entry. */
+    public interface NarrativeService {
+        record Narrative(String title, String description) {}
+        Narrative compose(BrilliantEntry entry);
+    }
+
+    /**
+     * Deterministic template stand-in so the whole module runs offline.
+     * Production: replace with a Claude call (see {@link PromptNarrative}).
+     */
+    public static final class StubNarrative implements NarrativeService {
+
+        @Override
+        public Narrative compose(BrilliantEntry e) {
+            String piece = pieceName(e.san());
+            boolean capture = e.san().contains("x");
+            boolean mate = e.san().contains("#");
+            String swingWord = e.evalGain() >= 3 ? "game-deciding" : e.evalGain() >= 1.5 ? "decisive" : "subtle";
+
+            String title;
+            if (mate)                        title = "A " + piece + " Mate For The Ages";
+            else if (e.evalGain() >= 3)      title = "The Devastating " + piece + " Surge";
+            else if (capture)                title = "The " + piece + " Strike Nobody Saw";
+            else                             title = "The Quiet " + piece + " That Changed Everything";
+
+            String action = capture ? "snatched material and" : "rearranged the position and";
+            String description = String.format(
+                    "From this position, %s (%s) %s the tables in one stroke: the evaluation swung "
+                    + "%+.1f pawns in the player's favour. Sagacious rated it the only move that keeps "
+                    + "the initiative — the kind of moment worth revisiting. Press repeat and watch it "
+                    + "again; the idea is easier to absorb the second time.",
+                    e.san(), e.ply() % 2 == 1 ? "White" : "Black", action, e.evalGain());
+
+            return new Narrative(title,
+                    swingWord.isEmpty() ? description : description);
+        }
+
+        private static String pieceName(String san) {
+            if (san.startsWith("O-O")) return "Castling";
+            switch (san.charAt(0)) {
+                case 'N': return "Knight";
+                case 'B': return "Bishop";
+                case 'R': return "Rook";
+                case 'Q': return "Queen";
+                case 'K': return "King";
+                default:  return "Pawn";
+            }
+        }
+    }
+
+    /** Carries the exact prompt for the real AI call (Claude integration). */
+    public static final class PromptNarrative {
+
+        private PromptNarrative() {}
+
+        public static String promptFor(BrilliantEntry e) {
+            return String.format(
+                "A chess player made a brilliant move. Write a short evocative title "
+                + "(3-6 words) and a one-paragraph description of why this move is brilliant.%n"
+                + "Position before the move (FEN): %s%n"
+                + "The move played (SAN): %s%n"
+                + "Evaluation swing in the player's favour: %+.1f pawns%n"
+                + "Return exactly two lines: first the title, then the paragraph.",
+                e.fenBefore(), e.san(), e.evalGain());
+        }
+    }
+
+    // =====================================================================
+    // Part 2 — Sagacious bridge (seam to analysis mode + board)
+    // =====================================================================
+
+    /** Loads positions/moves into the analysis board. Production: WebSocket to
+     *  the JS board (Module 2 engine) plus Sagacious (Module 3). */
+    public interface SagaciousBridge {
+        void loadPosition(String fen);
+        void playSan(String san);
+        void requestAnalysis(String fen);
+    }
+
+    /** Console stand-in that shows exactly what the real bridge will do. */
+    public static final class ConsoleBridge implements SagaciousBridge {
+        @Override public void loadPosition(String fen) {
+            System.out.println("   [board] position loaded: " + fen);
+        }
+        @Override public void playSan(String san) {
+            System.out.println("   [board] move played with animation: " + san);
+        }
+        @Override public void requestAnalysis(String fen) {
+            System.out.println("   [sagacious] analysis requested for: " + fen);
+        }
+    }
+
+    // =====================================================================
+    // Part 2 — The tab itself
+    // =====================================================================
+
+    /** One row of the menu as the UI renders it. */
+    public record TabEntryView(String entryId, String title, String description,
+                               String moveLabel, String fenBefore) {}
+
+    /** A live Sagacious-analysis view opened by clicking an entry's title. */
+    public static final class AnalysisSession {
+        private final SagaciousBridge bridge;
+        private final BrilliantEntry entry;
+        private int repeats;
+        private boolean open = true;
+
+        AnalysisSession(SagaciousBridge bridge, BrilliantEntry entry) {
+            this.bridge = bridge;
+            this.entry = entry;
+            // Entering analysis mode: load the BEFORE position, then play the move.
+            bridge.loadPosition(entry.fenBefore());
+            bridge.requestAnalysis(entry.fenBefore());
+            bridge.playSan(entry.san());
+            repeats = 1;
+        }
+
+        /** The repeat button. Replays the move over and over. */
+        public void repeat() {
+            if (!open) throw new IllegalStateException("session closed");
+            bridge.loadPosition(entry.fenBefore());
+            bridge.playSan(entry.san());
+            repeats++;
+        }
+
+        public int repeatCount() { return repeats; }
+        public boolean isOpen() { return open; }
+
+        public void close() {
+            open = false;
+            System.out.println("   [analysis] session closed (" + repeats + " viewing(s) of " + entry.san() + ")");
+        }
+    }
+
+    /** The Luminaries tab: counter header, narrated entries, click-through. */
+    public static final class LuminariesTab {
+        private final String playerId;
+        private final Ledger ledger;
+        private final SagaciousBridge bridge;
+
+        LuminariesTab(String playerId, Ledger ledger, SagaciousBridge bridge) {
+            this.playerId = playerId;
+            this.ledger = ledger;
+            this.bridge = bridge;
+        }
+
+        /** Header line: the lifetime counter lives here. */
+        public String header() {
+            int n = ledger.lifetimeCount(playerId);
+            return "✦ Luminaries — " + n + " lifetime " + (n == 1 ? "brilliancy" : "brilliancies");
+        }
+
+        /** Entries newest first; entries without a narrative yet show the move. */
+        public List<TabEntryView> entries() {
+            List<TabEntryView> out = new ArrayList<>();
+            for (BrilliantEntry e : ledger.entries(playerId)) {
+                String title = e.hasNarrative() ? e.title() : e.san() + " (move " + e.moveNumber() + ")";
+                String desc = e.hasNarrative() ? e.description() : "Narrative pending…";
+                String label = (e.ply() % 2 == 1 ? "White" : "Black") + " · game " + e.gameId();
+                out.add(new TabEntryView(e.entryId(), title, desc, label, e.fenBefore()));
+            }
+            return out;
+        }
+
+        /** The hyperlink behaviour: clicking a title opens analysis mode. */
+        public AnalysisSession openEntry(String entryId) {
+            BrilliantEntry e = ledger.find(playerId, entryId);
+            if (e == null) throw new IllegalArgumentException("no such entry: " + entryId);
+            System.out.println("   [link] title clicked -> opening Sagacious analysis mode");
+            return new AnalysisSession(bridge, e);
+        }
+    }
+
+    // =====================================================================
+    // Facade — the module's public API
+    // =====================================================================
+
+    private final Ledger ledger;
+    private final NarrativeService narrative;
+    private final SagaciousBridge bridge;
+
+    public Luminaries(Ledger ledger, NarrativeService narrative, SagaciousBridge bridge) {
+        this.ledger = ledger;
+        this.narrative = narrative;
+        this.bridge = bridge;
+    }
+
+    /**
+     * End-to-end pipeline call after each analysed game: extract FENs, record
+     * new entries (+1 counter each), and attach the AI narrative immediately.
+     * Safe to call repeatedly for the same game — dedup makes it idempotent.
+     */
+    public int submitAnalysedGame(GameTranscript game, List<Integer> brilliantPlies,
+                                  Map<Integer, Double> evalByPly) {
+        int added = 0;
+        for (BrilliantCandidate c : BrilliantExtractor.extract(game, brilliantPlies, evalByPly)) {
+            if (ledger.record(c)) {
+                added++;
+                BrilliantEntry stored = ledger.find(c.playerId(),
+                        BrilliantEntry.makeEntryId(c.playerId(), c.gameId(), c.ply()));
+                NarrativeService.Narrative n = narrative.compose(stored);
+                ledger.setNarrative(c.playerId(), stored.entryId(), n.title(), n.description());
+            }
+        }
+        return added;
+    }
+
+    public int lifetimeCount(String playerId) { return ledger.lifetimeCount(playerId); }
+
+    public LuminariesTab tabFor(String playerId) {
+        return new LuminariesTab(playerId, ledger, bridge);
+    }
+
+    public Ledger ledger() { return ledger; }
+
+    // =====================================================================
+    // Demo — full module walk-through
+    // =====================================================================
+
+    public static void main(String[] args) throws Exception {
+        System.out.println("=== Module 3c · Luminaries (Brilliant Move Counter) ===\n");
+
+        // --- synthetic transcripts (production: Codex replay supplies these) ---
+        String[] sansA = {
+            "e4","e5","Nf3","Nc6","Bb5","a6","Ba4","Nf6","O-O","Be7",
+            "Re1","b5","Bb3","d6","c3","O-O","h3","Nb8","d4","Nbd7",
+            "Nbd2","Bb7","Bc2","Re8","Nf1","Bf8","Ng3","g6"
+        };
+        String[] sansB = {
+            "e4","c5","Nf3","d6","d4","cxd4","Nxd4","Nf6","Nc3","a6",
+            "Be3","e5","Nce2","Be7","Qd2","O-O","O-O-O","Qc7","Kb1","Be6",
+            "f3","Nbd7","g4","b5"
+        };
+        GameTranscript gameA = transcript("g-2026-10-07-042", "abdul", "opponent-9", sansA);
+        // In game B, Abdul plays the Black side of a Sicilian.
+        GameTranscript gameB = transcript("g-2026-10-07-051", "opponent-4", "abdul", sansB);
+
+        Path file = Path.of("/tmp/luminaries-demo.txt");
+        Files.deleteIfExists(file);
+        Luminaries module = new Luminaries(new Ledger(file), new StubNarrative(), new ConsoleBridge());
+
+        // --- Part 1 in action: two games analysed ------------------------------
+        System.out.println("--- Ledger ingestion (Part 1) ---");
+        // Game A: ply 21 (White's Nbd2) brilliant, 0.6 -> 2.0
+        int a = module.submitAnalysedGame(gameA, List.of(21), Map.of(20, 0.6, 21, 2.0, 22, 1.8));
+        System.out.printf("game A: %d new entr%s%n", a, a == 1 ? "y" : "ies");
+        // Game B (Abdul as Black): ply 14 ...Be7 gains 1.7 (eval 0.3 -> -1.4 in White's view),
+        // ply 24 ...b5 gains 3.4 (eval 0.4 -> -3.0).
+        int b = module.submitAnalysedGame(gameB, List.of(14, 24),
+                Map.of(13, 0.3, 14, -1.4, 23, 0.4, 24, -3.0));
+        System.out.printf("game B: %d new entries%n", b);
+        // Same game re-analysed later -> idempotent, no double count.
+        int dup = module.submitAnalysedGame(gameA, List.of(21), Map.of(20, 0.6, 21, 2.0, 22, 1.8));
+        System.out.printf("re-analyse game A: %d new entries (dedup working: expect 0)%n", dup);
+        System.out.printf("Lifetime count: %d%n%n", module.lifetimeCount("abdul"));
+
+        // --- Part 2 in action: the tab -----------------------------------------
+        System.out.println("--- The Tab (Part 2) ---");
+        LuminariesTab tab = module.tabFor("abdul");
+        System.out.println(tab.header());
+        List<TabEntryView> views = tab.entries();
+        for (int i = 0; i < views.size(); i++) {
+            TabEntryView v = views.get(i);
+            System.out.printf("%d. %s%n", i + 1, v.title());
+            System.out.printf("   %s%n", v.description());
+            System.out.printf("   (%s · click title -> analysis mode)%n", v.moveLabel());
+        }
+
+        // Click the top entry's title -> analysis mode + repeat button.
+        System.out.println("\n--- Click a title -> Sagacious analysis mode ---");
+        AnalysisSession session = tab.openEntry(views.get(0).entryId());
+        session.repeat();
+        session.repeat();
+        System.out.printf("repeat pressed 3x total: %d viewings%n", session.repeatCount());
+        session.close();
+
+        // --- persistence round-trip ---------------------------------------------
+        Luminaries reloaded = new Luminaries(new Ledger(file), new StubNarrative(), new ConsoleBridge());
+        System.out.printf("%nAfter reload from file, lifetime count: %d%n", reloaded.lifetimeCount("abdul"));
+
+        // --- the real-AI seam ----------------------------------------------------
+        System.out.println("\n--- Production AI prompt (PromptNarrative) for the top entry ---");
+        System.out.println(PromptNarrative.promptFor(
+                reloaded.ledger.entries("abdul").get(0)));
+    }
+
+    private static GameTranscript transcript(String gameId, String whiteId, String blackId, String[] sans) {
+        GameTranscript.Builder g = GameTranscript.builder()
+                .gameId(gameId).whitePlayerId(whiteId).blackPlayerId(blackId);
+        for (int ply = 1; ply <= sans.length; ply++) {
+            // Structurally valid placeholder FEN per ply; real FENs come from Codex.
+            g.addMove(sans[ply - 1],
+                    FenUtils.START_POS.replace(" 0 1", " 0 " + ((ply + 1) / 2)));
+        }
+        return g.build();
+    }
+}
